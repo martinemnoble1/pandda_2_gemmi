@@ -38,6 +38,9 @@ license.file = "LICENSE"
 readme = "README.md"
 requires-python = ">=3.9"
 
+[project.scripts]
+"pandda2.analyse" = "pandda_gemmi.cli:main"
+
 #[project.optional-dependencies]
 #intel = ["scikit-learn-intelex",]
 

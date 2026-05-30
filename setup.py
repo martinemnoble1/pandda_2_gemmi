@@ -30,6 +30,9 @@ setuptools.setup(
     install_requires=requirements(),
     scripts=[
         "scripts/pandda_rhofit.sh",
-        "scripts/pandda2.analyse",
     ]
+    # NOTE: ``pandda2.analyse`` is now provided as a console_scripts entry point
+    # in pyproject.toml (pandda_gemmi.cli:main), which installs with the correct
+    # interpreter and needs no path resolution. The old scripts/pandda2.analyse
+    # bash wrapper referenced an uninstalled pandda.py and was not macOS-portable.
 )
