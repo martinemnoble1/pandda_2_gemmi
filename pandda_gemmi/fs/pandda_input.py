@@ -153,9 +153,29 @@ def parse_dir_ligands(path: Path, ligand_cif_regex, ligand_smiles_regex, ligand_
 
 
 def get_input_ligands(path: Path, ligand_dir_regex, ligand_cif_regex, ligand_smiles_regex, ligand_pdb_regex, check_input):
-    # path_ligands = parse_dir_ligands(path, ligand_cif_regex, ligand_smiles_regex, ligand_pdb_regex, )
     path_ligands = {}
+
+    # First, look for ligand files directly in the dataset directory (a "flat"
+    # layout, e.g. ligand.cif / ligand.pdb beside the pdb/mtz). This is the
+    # layout used by the published PanDDA benchmark datasets on Zenodo, and
+    # without this a flat dataset is filtered out with "no ligand data!" unless
+    # the ligands are manually moved into a subdirectory.
+    for ligand_key, ligand_files in parse_dir_ligands(
+            path,
+            ligand_cif_regex,
+            ligand_smiles_regex,
+            ligand_pdb_regex,
+            check_input,
+    ).items():
+        path_ligands[ligand_key] = ligand_files
+
+    # Then look inside any subdirectory matching ligand_dir_regex (e.g.
+    # "compound"). Subdirectory ligands take precedence when more complete.
     for ligand_dir_path in path.glob("*"):
+        # Only directories can be ligand subdirectories; skip the flat files
+        # already handled above.
+        if not ligand_dir_path.is_dir():
+            continue
         # print(f"Attempting match of {ligand_dir_path.name} to {ligand_dir_regex}")
         match = re.match(str(ligand_dir_regex), str(ligand_dir_path.name))
         # print(f"Match: {match}")
