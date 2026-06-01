@@ -477,11 +477,6 @@ class HeirarchicalSiteModelAlignedSequences:
                 if aligned_dtag == mov_dtag:
                     mov_chain_classes[aligned_chain] = (alignment_dtag, alignment_chain)
 
-        rprint('ref_chain_classes')
-        rprint(ref_chain_classes)
-        rprint('mov_chain_classes')
-        rprint(mov_chain_classes)
-
         # Map residues between the environments
         try:
             ref_aligned_resids = []
@@ -514,11 +509,6 @@ class HeirarchicalSiteModelAlignedSequences:
             rprint(alignment)
             raise Exception
         mov_aligned_resids_set = set(mov_aligned_resids)
-
-        rprint('ref_aligned_resids_set')
-        rprint(ref_aligned_resids_set)
-        rprint('mov_aligned_resids_set')
-        rprint(mov_aligned_resids_set)
 
         union = mov_aligned_resids_set.union(ref_aligned_resids_set)
         intersection = mov_aligned_resids_set.intersection(ref_aligned_resids_set)
@@ -573,18 +563,12 @@ class HeirarchicalSiteModelAlignedSequences:
         
         # Get the sequence alignments
         msa = self.get_alignments(datasets)
-        rprint('Multiple sequence alignment is:')
-        rprint(msa)
 
         # Find the residue environment of each event (chain and residue number)
         event_environments: Dict[Tuple[str, int], List[Tuple[str, str]]] = self.get_event_environments(datasets, events, distance=self.distance)
-        rprint('Event environments are:')
-        rprint(event_environments)
 
         # Get overlaps
         distances = self.get_event_distances(event_environments, msa)
-        rprint('Distances:')
-        rprint(distances)
 
         # Find the site centroids against the reference
         distance_matrix = np.array(
@@ -599,14 +583,10 @@ class HeirarchicalSiteModelAlignedSequences:
 
             ]
         )
-        rprint('Distance matrix is:')
-        rprint(distance_matrix)
 
         event_id_array = np.array(
             [_event_id for _event_id in distances.keys()]
         )
-        rprint('Event id array is:')
-        rprint(event_id_array)
 
         # Cluster the centroids
         linkage = scipy.cluster.hierarchy.linkage(
@@ -627,9 +607,6 @@ class HeirarchicalSiteModelAlignedSequences:
         #     method="complete",
             
         # )
-        rprint('Clusters are:')
-        rprint(clusters)
-
 
         # Get the event sites
         event_sites = {}
