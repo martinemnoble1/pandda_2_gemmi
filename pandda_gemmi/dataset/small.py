@@ -17,6 +17,37 @@ bond_type_cif_to_rdkit = {
 
 }
 
+
+def get_comp_block_key(cif):
+    """Resolve the name of the ligand restraint block in a _chem_comp cif.
+
+    A monomer dictionary contains a "comp_list" header block plus the actual
+    restraint block named "comp_<TLC>" (e.g. comp_LIG, comp_DRG). The
+    three-letter code varies between dictionary generators (acedrg, grade,
+    refmac, ...), so read the block from the document rather than guessing the
+    TLC: return the first block (other than the comp_list header) that contains
+    a _chem_comp_atom loop. Falls back to the historical comp_LIG/comp_XXX
+    guesses for unusual layouts.
+    """
+    for block in cif:
+        if block.name == "comp_list":
+            continue
+        if list(block.find_loop('_chem_comp_atom.atom_id')):
+            return block.name
+
+    for candidate in ("comp_LIG", "comp_XXX"):
+        try:
+            cif[candidate]
+            return candidate
+        except Exception:
+            continue
+
+    raise KeyError(
+        "No _chem_comp restraint block found in cif "
+        f"(blocks present: {[block.name for block in cif]})"
+    )
+
+
 def get_fragment_mol_from_dataset_cif_path(dataset_cif_path: Path):
     # Open the cif document with gemmi
     cif = gemmi.cif.read(str(dataset_cif_path))
@@ -25,11 +56,7 @@ def get_fragment_mol_from_dataset_cif_path(dataset_cif_path: Path):
     mol = Chem.Mol()
     editable_mol = Chem.EditableMol(mol)
 
-    key = "comp_LIG"
-    try:
-        cif['comp_LIG']
-    except:
-        key = "comp_XXX"
+    key = get_comp_block_key(cif)
 
     # Find the relevant atoms loop
     atom_id_loop = list(cif[key].find_loop('_chem_comp_atom.atom_id'))

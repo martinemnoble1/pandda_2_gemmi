@@ -16,6 +16,7 @@ from ..interfaces import *
 from ..fs import try_make
 from ..dmaps import load_dmap, save_dmap, SparseDMap
 from ..dataset.structure import save_structure, load_structure, Structure
+from ..dataset.small import get_comp_block_key
 from .autobuild import AutobuildResult
 
 
@@ -101,11 +102,7 @@ def get_fragment_mol_from_dataset_cif_path(dataset_cif_path: Path):
     mol = Chem.Mol()
     editable_mol = Chem.EditableMol(mol)
 
-    key = "comp_LIG"
-    try:
-        cif['comp_LIG']
-    except:
-        key = "comp_XXX"
+    key = get_comp_block_key(cif)
 
     # Find the relevant atoms loop
     atom_id_loop = list(cif[key].find_loop('_chem_comp_atom.atom_id'))
@@ -262,11 +259,8 @@ def get_structures_from_mol(mol: Chem.Mol, dataset_cif_path, max_conformers):
     cif = gemmi.cif.read(str(dataset_cif_path))
 
     # Find the relevant atoms loop
-    try:
-        atom_id_loop = list(cif['comp_LIG'].find_loop('_chem_comp_atom.atom_id'))
-    # print(f"Atom ID loop: {atom_id_loop}")
-    except:
-        atom_id_loop = list(cif['comp_XXX'].find_loop('_chem_comp_atom.atom_id'))
+    key = get_comp_block_key(cif)
+    atom_id_loop = list(cif[key].find_loop('_chem_comp_atom.atom_id'))
 
     fragment_structures = {}
     for i, conformer in enumerate(mol.GetConformers()):
