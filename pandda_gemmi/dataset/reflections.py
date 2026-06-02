@@ -94,18 +94,40 @@ def drop_columns(reflections, f, phi):
     # Add dataset
     new_reflections.add_dataset("truncated")
 
+    # Identify the free-R flag column.
+    #
+    # Historically only three hard-coded labels were recognised. Real-world
+    # MTZs (e.g. CCP4/DIMPLE output) frequently label the column differently,
+    # e.g. "FREERFLAG_FREER", which broke loading with "No RFree Flag found!".
+    #
+    # The free-R flag is a distinct MTZ *column type* ("I", integer flag), so
+    # we fall back to matching on type rather than label. Preference order:
+    #   1. The conventional labels (fast path, fully backwards compatible).
+    #   2. gemmi's own rfree_column() helper (knows further standard labels).
+    #   3. An integer-type ("I") column: if exactly one exists it is the flag;
+    #      if several, prefer the one whose label contains "free". We never pick
+    #      ambiguously - if the choice is unclear we fall through and raise.
     free_flag = None
 
-    for column in reflections.columns:
-        if column.label == "FREE":
-            free_flag = "FREE"
+    column_labels = reflections.column_labels()
+    for label in ("FREE", "FreeR_flag", "R-free-flags"):
+        if label in column_labels:
+            free_flag = label
             break
-        if column.label == "FreeR_flag":
-            free_flag = "FreeR_flag"
-            break
-        if column.label == "R-free-flags":
-            free_flag = "R-free-flags"
-            break
+
+    if free_flag is None:
+        gemmi_rfree = reflections.rfree_column()
+        if gemmi_rfree is not None:
+            free_flag = gemmi_rfree.label
+
+    if free_flag is None:
+        int_columns = [column.label for column in reflections.columns if column.type == "I"]
+        if len(int_columns) == 1:
+            free_flag = int_columns[0]
+        elif len(int_columns) > 1:
+            free_like = [label for label in int_columns if "free" in label.lower()]
+            if len(free_like) == 1:
+                free_flag = free_like[0]
 
     if not free_flag:
         raise Exception("No RFree Flag found!")
