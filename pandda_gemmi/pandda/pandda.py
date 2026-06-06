@@ -63,6 +63,12 @@ def pandda(args: PanDDAArgs):
     time_begin_process_datasets = time.time()
     console.start_process_shells()
     for j, dtag in enumerate(datasets_to_process):
+        # Structured progress signal for downstream automation that needs to
+        # track per-dataset progress without scraping log-format-dependent
+        # output. Matches the regex ^PANDDA_PROGRESS: dataset (\d+)/(\d+)$.
+        # flush=True ensures the line lands on the stream before Ray batches
+        # more output behind it.
+        print(f"PANDDA_PROGRESS: dataset {j + 1}/{len(datasets_to_process)}", flush=True)
         new_pandda_events, new_autobuilds = process_dataset(
             dtag,
             args,
