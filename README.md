@@ -62,14 +62,15 @@ With Anaconda an environment can be setup like so:
 
 ```bash
 conda create -n pandda2 python=3.9
+conda activate pandda2
 conda install llvm python-devtools # If building gemmi from source
 ```
 
 Then:
 
 ```bash
-git clone https://github.com/ConorFWild/pandda_2_gemmi.git
-cd pandda_2_gemmi 
+git clone https://github.com/xchem/PanDDA2.git
+cd PanDDA2
 python -m pip install -e . 
 
 ```
@@ -128,6 +129,10 @@ OR
 ```bash
 python scripts/pandda.py --data_dirs=<data directories> --out_dir=<output directory> --pdb_regex=<pdb regex> --mtz_regex=<mtz regex> --local_cpus=<your number of cpus>
 ```
+
+Ensure you provide the full path to your data and output directories. 
+
+If you see the error `python3.9: can't open file '/Path/to/conda/envs/pandda2/bin/pandda.py': [Errno 2] No such file or directory` use `python scripts/pandda.py` to run PanDDA2 while in the PanDDA2 directory.
 
 After PanDDA 2 has finished running, then results can be inspected with pandda.inspect as per PanDDA 1 (https://pandda.bitbucket.io/).
 

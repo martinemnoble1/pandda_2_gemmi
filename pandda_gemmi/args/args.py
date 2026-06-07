@@ -39,7 +39,7 @@ class PanDDAKWArgs:
     max_rmsd_to_reference: float = 1.5
     max_rfree: float = 0.4
     use_rwork: float = False
-    dataset_range: str = "0-99999"
+    dataset_range: Optional[str] = None
     max_wilson_plot_z_score: float = 1.5
     same_space_group_only: bool = False
     similar_models_only: bool = False
@@ -320,10 +320,15 @@ class PanDDAKWArgs:
             default=False,
             help=constants.ARGS_USE_RWORK_HELP,
         )
+        def parse_range(range):
+            if range is None:
+                return None
+            else:
+                return str(range)
         parser.add_argument(
             constants.ARGS_DATASET_RANGE,
-            type=str,
-            default='0-99999',
+            type=parse_range,
+            default=None,
             help=constants.ARGS_DATASET_RANGE_HELP,
         )
 

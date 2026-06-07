@@ -42,7 +42,7 @@ from pandda_gemmi.event_model.filter import (
 from pandda_gemmi.event_model.select import select_model
 from pandda_gemmi.event_model.output import output_maps
 from pandda_gemmi.event_model.filter_selected_events import filter_selected_events
-
+from pandda_gemmi import serialize
 from pandda_gemmi.autobuild import AutobuildResult
 from pandda_gemmi.autobuild.inbuilt import mask_dmap, get_conformers, autobuild_conformer
 
