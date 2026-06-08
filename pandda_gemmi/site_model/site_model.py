@@ -485,6 +485,12 @@ class HeirarchicalSiteModelAlignedSequences:
                     continue
                 chain_class = ref_chain_classes[chain]
                 alignment = msa[chain_class][(ref_dtag, chain)]
+                # Skip residues with no aligned index (e.g. waters / heteroatoms
+                # that fall in the event environment): the MSA only maps protein
+                # residues, so indexing a non-protein residue would KeyError.
+                # Such residues can't be sequence-matched across datasets anyway.
+                if res not in alignment:
+                    continue
                 aligned_index = alignment[res]
                 ref_aligned_resids.append((chain_class[1], aligned_index))
             ref_aligned_resids_set = set(ref_aligned_resids)
@@ -492,7 +498,7 @@ class HeirarchicalSiteModelAlignedSequences:
             rprint('mov res and alignment')
             rprint(res)
             rprint(alignment)
-            raise Exception
+            raise
         
         mov_aligned_resids = []
         try:
@@ -501,13 +507,17 @@ class HeirarchicalSiteModelAlignedSequences:
                     continue
                 chain_class = mov_chain_classes[chain]
                 alignment = msa[chain_class][(mov_dtag, chain)]
+                # Skip residues with no aligned index (waters / heteroatoms);
+                # see the matching guard in the ref block above.
+                if res not in alignment:
+                    continue
                 aligned_index = alignment[res]
                 mov_aligned_resids.append((chain_class[1], aligned_index))
         except:
             rprint('mov res and alignment')
             rprint(res)
             rprint(alignment)
-            raise Exception
+            raise
         mov_aligned_resids_set = set(mov_aligned_resids)
 
         union = mov_aligned_resids_set.union(ref_aligned_resids_set)
