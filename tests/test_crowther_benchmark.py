@@ -1,7 +1,7 @@
 """Benchmark: SH-Crowther FRF vs brute-force rotation search.
 
 Apples-to-apples on the synthetic arbitrary-rotation scenarios from
-test_sht_fit: both methods use the SAME SO(3) sample set and the SAME
+test_crowther_fit: both methods use the SAME SO(3) sample set and the SAME
 translation/Tanimoto scoring (refine_translation_with_clash). The only
 difference is the rotation search --
 
@@ -13,7 +13,7 @@ difference is the rotation search --
 Reports per-conformer accuracy (RMSD-to-truth) and timing, and the FRF one-off
 precompute cost (amortised across all conformers a worker handles). Run with::
 
-    pytest tests/test_sht_benchmark.py -s -q
+    pytest tests/test_crowther_benchmark.py -s -q
 
 The asserts are deliberately loose (this is a benchmark, not a unit test): FRF
 must not be meaningfully less accurate than exhaustive brute, and must be
@@ -26,13 +26,13 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from pandda_gemmi.autobuild.sht import rotation as rot, voxelise as vox
-from pandda_gemmi.autobuild.sht.translation import refine_translation_with_clash
-from pandda_gemmi.autobuild.sht.fit import (
-    ShtConfig, build_precompute, cut_cube, prepare_target, patterson_input,
-    fit_conformer_sht, _voxel_to_shift, _heavy_atoms,
+from pandda_gemmi.autobuild.crowther import rotation as rot, voxelise as vox
+from pandda_gemmi.autobuild.crowther.translation import refine_translation_with_clash
+from pandda_gemmi.autobuild.crowther.fit import (
+    CrowtherConfig, build_precompute, cut_cube, prepare_target, patterson_input,
+    fit_conformer_crowther, _voxel_to_shift, _heavy_atoms,
 )
-from tests.test_sht_fit import _COORDS, _gemmi_structure, _density_grid, _heavy_coords
+from tests.test_crowther_fit import _COORDS, _gemmi_structure, _density_grid, _heavy_coords
 
 
 _START_ROTATIONS = [
@@ -46,7 +46,7 @@ _T_TRUE = np.array([1.5, -1.0, 0.5])
 
 def _brute_fit(centre, conformer, target_grid, pre, ligand_radius):
     """Exhaustive rotation search over pre.Rs_mat with per-rotation translation
-    FFT + Tanimoto. Same scoring + write-back as fit_conformer_sht; differs only
+    FFT + Tanimoto. Same scoring + write-back as fit_conformer_crowther; differs only
     in evaluating every rotation instead of an SH-ranked top-K."""
     cfg = pre.config
     n, spacing = cfg.grid, cfg.spacing
@@ -82,7 +82,7 @@ def _brute_fit(centre, conformer, target_grid, pre, ligand_radius):
 
 @pytest.mark.parametrize("grid,n_rot", [(32, 2000)])
 def test_benchmark_frf_vs_brute(grid, n_rot, capsys):
-    cfg = ShtConfig(grid=grid, spacing=0.5, L_max=12, n_r=14,
+    cfg = CrowtherConfig(grid=grid, spacing=0.5, L_max=12, n_r=14,
                     n_rotations=n_rot, sigma=1.0, top_k=30)
 
     t0 = time.perf_counter()
@@ -99,7 +99,7 @@ def test_benchmark_frf_vs_brute(grid, n_rot, capsys):
         conformer = _gemmi_structure(_COORDS @ R_start.T)
 
         t0 = time.perf_counter()
-        st, frf_score, _c = fit_conformer_sht(
+        st, frf_score, _c = fit_conformer_crowther(
             centre, conformer, target_grid, pre, ligand_radius=6.0)
         frf_s = time.perf_counter() - t0
         frf_rmsd = np.sqrt(((_heavy_coords(st) - truth) ** 2).sum(1).mean())

@@ -1,10 +1,10 @@
-"""Correctness tests for the SH-Crowther FRF ligand fit (pandda_gemmi.autobuild.sht).
+"""Correctness tests for the SH-Crowther FRF ligand fit (pandda_gemmi.autobuild.crowther).
 
 Synthetic, self-contained (no checkpoints / no bundle). They pin the two
 silent-failure modes flagged as holes during scaffolding:
 
   - HOLE 4: the translation-FFT wrap/sign convention (plant a probe at a known
-    offset, recover it end-to-end through fit_conformer_sht).
+    offset, recover it end-to-end through fit_conformer_crowther).
   - HOLE 7: the cube cut-out axis order (a transpose would be silent-wrong).
 
 plus a fast regression of the FRF identity self-test and a rotation-recovery
@@ -15,10 +15,10 @@ import numpy as np
 import gemmi
 import pytest
 
-from pandda_gemmi.autobuild.sht import rotation as rot, voxelise as vox
-from pandda_gemmi.autobuild.sht.translation import refine_translation_with_clash
-from pandda_gemmi.autobuild.sht.fit import (
-    ShtConfig, build_precompute, cut_cube, fit_conformer_sht, _voxel_to_shift,
+from pandda_gemmi.autobuild.crowther import rotation as rot, voxelise as vox
+from pandda_gemmi.autobuild.crowther.translation import refine_translation_with_clash
+from pandda_gemmi.autobuild.crowther.fit import (
+    CrowtherConfig, build_precompute, cut_cube, fit_conformer_crowther, _voxel_to_shift,
     sigma_from_resolution, prepare_event_target, fit_conformer_against,
 )
 
@@ -135,7 +135,7 @@ def test_cut_cube_axis_order():
 def test_frf_identity_self_correlation():
     """SH rotation score at identity == direct radial integral of the Patterson
     (up to SH truncation at L)."""
-    cfg = ShtConfig(grid=32, spacing=0.5, L_max=8, n_r=12, n_rotations=64)
+    cfg = CrowtherConfig(grid=32, spacing=0.5, L_max=8, n_r=12, n_rotations=64)
     pre = build_precompute(cfg)
     n, sp = cfg.grid, cfg.spacing
     stamp, r_vox = vox.make_gaussian_stamp(cfg.sigma, sp)
@@ -166,7 +166,7 @@ def test_translation_convention(t_true):
     """Pure translation-FFT sign/wrap test, no rotation, no masking. Plant the
     target as the probe shifted by +t_true; _voxel_to_shift(best voxel) must
     return exactly +t_true (the shift to add to the probe). This is the
-    deterministic guard for the convention fit_conformer_sht relies on."""
+    deterministic guard for the convention fit_conformer_crowther relies on."""
     n, sp = 32, 0.5
     centre = np.array([n / 2 * sp] * 3)
     origin = np.zeros(3)
@@ -206,7 +206,7 @@ def _heavy_coords(structure):
     (120.0, 70.0, -40.0),
 ])
 def test_fit_repositions_arbitrarily_rotated_model(euler_start):
-    """Full fit_conformer_sht. The target is the canonical conformer at
+    """Full fit_conformer_crowther. The target is the canonical conformer at
     centre + t_true; the *input* conformer is the same molecule in an arbitrary
     starting orientation. The fitted heavy atoms must land on the truth coords
     (joint rotation + translation recovery) to seed accuracy.
@@ -225,11 +225,11 @@ def test_fit_repositions_arbitrarily_rotated_model(euler_start):
     R_start = Rotation.from_euler("xyz", euler_start, degrees=True).as_matrix()
     conformer = _gemmi_structure(_COORDS @ R_start.T)  # arbitrary start pose
 
-    cfg = ShtConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
+    cfg = CrowtherConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
                     n_rotations=3000, sigma=1.0, top_k=30)
     pre = build_precompute(cfg)
 
-    st, _score, _pc = fit_conformer_sht(
+    st, _score, _pc = fit_conformer_crowther(
         centre, conformer, target_grid, pre, ligand_radius=6.0)
 
     placed = _heavy_coords(st)
@@ -244,7 +244,7 @@ def test_rotation_recovery_sanity():
     top rotation must give high real-space overlap (>0.7) and beat a random
     rotation. Lenient (SO(3) is sampled, not exhaustive)."""
     from scipy.spatial.transform import Rotation
-    cfg = ShtConfig(grid=32, spacing=0.5, L_max=12, n_r=14, n_rotations=3000)
+    cfg = CrowtherConfig(grid=32, spacing=0.5, L_max=12, n_r=14, n_rotations=3000)
     pre = build_precompute(cfg)
     n, sp = cfg.grid, cfg.spacing
     centre = np.array([n / 2 * sp] * 3)
@@ -305,14 +305,14 @@ def test_fit_sigma_override_is_used_not_cached_config():
     target_grid = _density_grid(truth)
     conformer = _gemmi_structure(_COORDS)
 
-    cfg = ShtConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
+    cfg = CrowtherConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
                     n_rotations=2000, sigma=1.0, top_k=30)
     pre = build_precompute(cfg)
 
     # override with a resolution-derived sigma; pose recovery must still hold
     sigma = sigma_from_resolution(2.0)
     assert sigma != cfg.sigma
-    st, _score, _c = fit_conformer_sht(
+    st, _score, _c = fit_conformer_crowther(
         centre, conformer, target_grid, pre, ligand_radius=6.0, sigma=sigma)
     rmsd = np.sqrt(((_heavy_coords(st) - truth) ** 2).sum(axis=1).mean())
     assert rmsd < 1.5, f"RMSD {rmsd:.2f} A with sigma override {sigma:.2f}"
@@ -339,10 +339,10 @@ def test_fit_on_monoclinic_source_grid():
     R_start = Rotation.from_euler("xyz", [55, -30, 80], degrees=True).as_matrix()
     conformer = _gemmi_structure(_COORDS @ R_start.T)
 
-    cfg = ShtConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
+    cfg = CrowtherConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
                     n_rotations=2000, sigma=1.0, top_k=30)
     pre = build_precompute(cfg)
-    st, _s, _c = fit_conformer_sht(centre, conformer, grid, pre, ligand_radius=6.0)
+    st, _s, _c = fit_conformer_crowther(centre, conformer, grid, pre, ligand_radius=6.0)
     rmsd = np.sqrt(((_heavy_coords(st) - truth) ** 2).sum(axis=1).mean())
     assert rmsd < 1.5, f"monoclinic-source RMSD {rmsd:.2f} A"
 
@@ -361,7 +361,7 @@ def test_event_target_prepared_once_fits_many_conformers():
     truth = _COORDS + centre + t_true
     target_grid = _density_grid(truth)
 
-    cfg = ShtConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
+    cfg = CrowtherConfig(grid=32, spacing=0.5, L_max=12, n_r=14,
                     n_rotations=2000, sigma=1.0, top_k=30)
     pre = build_precompute(cfg)
 

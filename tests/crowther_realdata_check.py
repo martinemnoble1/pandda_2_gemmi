@@ -5,7 +5,7 @@ Generic and dataset-agnostic -- point it at any PanDDA processed_datasets dir.
 Use a PUBLIC dataset (e.g. the BAZ2B PanDDA demo data from Zenodo) for anything
 shareable. Not a pytest; a driver. Run::
 
-    python tests/sht_realdata_check.py <processed_datasets_dir> <dtag> [event_id]
+    python tests/crowther_realdata_check.py <processed_datasets_dir> <dtag> [event_id]
     # or set PANDDA_PROCESSED_DIR + PANDDA_DTAG
 
 Expects the standard per-dataset layout:
@@ -26,8 +26,8 @@ import yaml
 
 from pandda_gemmi.fs.pandda_input import LigandFiles
 from pandda_gemmi.autobuild.inbuilt import get_conformers
-from pandda_gemmi.autobuild.sht.fit import (
-    ShtConfig, get_precompute, prepare_event_target, fit_conformer_against,
+from pandda_gemmi.autobuild.crowther.fit import (
+    CrowtherConfig, get_precompute, prepare_event_target, fit_conformer_against,
     sigma_from_resolution,
 )
 
@@ -65,7 +65,7 @@ def main(processed_dir, dtag, event_id=1, resolution=2.5):
         print("  WARNING: degenerate conformer (radius ~0) -- embedding likely "
               "failed for this ligand; FRF result will be meaningless")
 
-    cfg = ShtConfig()
+    cfg = CrowtherConfig()
     sigma = sigma_from_resolution(resolution)
     print(f"  config grid={cfg.grid} L={cfg.L_max} N={cfg.n_rotations} "
           f"cube={cfg.grid*cfg.spacing:.0f}A sigma={sigma:.2f}")
@@ -90,7 +90,7 @@ def main(processed_dir, dtag, event_id=1, resolution=2.5):
     print(f"  Tanimoto {tani:.3f}  pose centroid {np.array(pose_c).round(2)}  "
           f"|pose-event| {np.linalg.norm(np.array(pose_c)-centroid):.2f} A")
 
-    out = ddir / f"{dtag}_event{event_id}_sht_fit.pdb"
+    out = ddir / f"{dtag}_event{event_id}_crowther_fit.pdb"
     st.setup_entities()
     st.write_pdb(str(out))
     print(f"  wrote {out} -- inspect against the z-map in coot")

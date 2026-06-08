@@ -14,7 +14,7 @@ returning the same 4-tuple ``(optimized_structure, score, centroid, arr)`` so
 the downstream CNN/bdc/signal path is untouched.
 
 The expensive precompute (Y_conj, Wigner-D batch, shell grid, SO(3) set) is
-dataset-independent: build a single ``ShtPrecompute`` at PanDDA2 startup
+dataset-independent: build a single ``CrowtherPrecompute`` at PanDDA2 startup
 (alongside get_scoring_models) and broadcast it via processor.put, exactly like
 reference_frame_ref. Per-conformer cost is then just the cube cut, the stamp,
 two shell samplings, the cross-correlation tensor, score_all_rotations, and the
@@ -42,7 +42,7 @@ from .translation import refine_translation_with_clash
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ShtConfig:
+class CrowtherConfig:
     """FRF fit parameters.
 
     Memory note: the dominant resident allocation is the Wigner-D batch
@@ -52,7 +52,7 @@ class ShtConfig:
     ``n_rotations`` and ``L_max`` are the real per-worker memory levers; per-fit
     transients (~31 MB at grid=64) are freed on return. FINDINGS sec.6 reports a
     structured N~128/L=8 cover matching random N~300 on recall@10 -- see
-    ShtConfig.lean(). The per-fit peak scales with grid^3 (cut to grid=32 = 8x
+    CrowtherConfig.lean(). The per-fit peak scales with grid^3 (cut to grid=32 = 8x
     less if needed)."""
     grid: int = 64               # power of 2 (radix-2 FFT)
     spacing: float = 0.5         # A, isotropic
@@ -64,6 +64,18 @@ class ShtConfig:
     lambda_clash: float = 0.0    # HOLE 3: clash weight (0 disables)
     headroom: float = 2.5        # Patterson clean-box: cube edge >= headroom x span
     rotation_seed: int = 42
+    # Crowther-Blow integration radius for the SH shells. The rotation function
+    # must read the ligand's intramolecular (self) vectors -- which extend only
+    # to the molecular diameter -- NOT the full box half-width, or r^2-weighted
+    # outer shells of noise/cross-vectors swamp the signal on real density.
+    # None -> box half-width (legacy); set to ~ligand extent + margin.
+    r_max_shell: float | None = 8.0
+    # Rotation function: direct density overlap about the (accurate) event
+    # centroid by default. The Patterson route squares weak difference-density
+    # noise and was shown to diverge from exhaustive brute on real event maps
+    # (FRF<->brute up to 4 A) whereas direct density reproduces brute exactly
+    # (FRF<->brute 0.00). Patterson kept as opt-in for untrustworthy centroids.
+    use_patterson: bool = False
 
     @classmethod
     def lean(cls, **overrides):
@@ -75,8 +87,8 @@ class ShtConfig:
 
 
 @dataclass
-class ShtPrecompute:
-    config: ShtConfig
+class CrowtherPrecompute:
+    config: CrowtherConfig
     r: np.ndarray
     dr: float
     theta: np.ndarray
@@ -100,14 +112,14 @@ def sigma_from_resolution(resolution: float,
 _PRECOMPUTE_CACHE: dict = {}
 
 
-def get_precompute(config: ShtConfig) -> ShtPrecompute:
+def get_precompute(config: CrowtherConfig) -> CrowtherPrecompute:
     """Cached ``build_precompute``. The tables depend only on these fields, not
     on any dataset, so one build per worker process is reused across every
     (event, conformer) it handles. (A proper integration would build once at
     startup and broadcast via processor.put; this module-level cache is the
     surgical equivalent for the behind-a-flag A/B.)"""
     key = (config.grid, config.spacing, config.L_max, config.n_r,
-           config.n_rotations, config.rotation_seed)
+           config.n_rotations, config.rotation_seed, config.r_max_shell)
     pre = _PRECOMPUTE_CACHE.get(key)
     if pre is None:
         pre = build_precompute(config)
@@ -115,14 +127,14 @@ def get_precompute(config: ShtConfig) -> ShtPrecompute:
     return pre
 
 
-def build_precompute(config: ShtConfig) -> ShtPrecompute:
+def build_precompute(config: CrowtherConfig) -> CrowtherPrecompute:
     """Build the dataset-independent tables. Call once at startup.
 
     r_max defaults to the cube half-width; HOLE 5 (in make_spherical_grid)
     suggests tightening it to ~ligand diameter and dropping the origin shell to
     focus the FRF on intramolecular vectors.
     """
-    r_max = config.grid / 2.0 * config.spacing
+    r_max = config.r_max_shell or (config.grid / 2.0 * config.spacing)
     r, dr, theta, _cos_t, _sin_t, w_t, phi, w_phi = rot.make_spherical_grid(
         config.L_max, config.n_r, r_max)
     Y_conj = rot.precompute_Y_conj(theta, phi, w_t, w_phi, config.L_max)
@@ -130,7 +142,7 @@ def build_precompute(config: ShtConfig) -> ShtPrecompute:
     euler = rng.as_euler("ZYZ", degrees=False)
     Rs_mat = rng.as_matrix().astype(np.float32)
     D_batch = rot.precompute_D_batch(euler, config.L_max)
-    return ShtPrecompute(config=config, r=r, dr=dr, theta=theta, phi=phi,
+    return CrowtherPrecompute(config=config, r=r, dr=dr, theta=theta, phi=phi,
                          Y_conj=Y_conj, euler=euler, Rs_mat=Rs_mat,
                          D_batch=D_batch)
 
@@ -172,10 +184,42 @@ def cut_cube(grid: gemmi.FloatGrid, centroid, n: int, spacing: float):
 # Target preprocessing (experimental density -> clean Patterson input)
 # ---------------------------------------------------------------------------
 
+def gaussian_lowpass(cube: np.ndarray, spacing: float, sigma: float) -> np.ndarray:
+    """Convolve a cube with a Gaussian of width ``sigma`` (A) via Fourier space:
+    H(s) = exp(-2 pi^2 sigma^2 |s|^2). Suppresses the noise-dominated high-
+    frequency shells of an experimental difference-density cube so its Patterson
+    (which squares noise) and the matched-filter correlation are cleaner, and so
+    its bandwidth matches the single-Gaussian probe. (This is the cheap half of a
+    Wiener filter -- noise-band suppression without an explicit S/N estimate.)"""
+    n = cube.shape[0]
+    fx = np.fft.fftfreq(n, d=spacing)
+    fz = np.fft.rfftfreq(n, d=spacing)
+    s2 = (fx[:, None, None] ** 2 + fx[None, :, None] ** 2 + fz[None, None, :] ** 2)
+    H = np.exp(-2.0 * (np.pi ** 2) * (sigma ** 2) * s2).astype(np.float32)
+    return np.fft.irfftn(np.fft.rfftn(cube.astype(np.float32)) * H,
+                         s=cube.shape).astype(np.float32)
+
+
+def _density_com(cube: np.ndarray, origin: np.ndarray, spacing: float) -> np.ndarray:
+    """Centre of mass (world A) of a non-negative density cube. Used to centre
+    the direct-density rotation expansion on the actual density rather than the
+    (possibly off) event centroid."""
+    w = np.clip(cube, 0.0, None)
+    tot = float(w.sum())
+    n = cube.shape[0]
+    ax = np.arange(n) * spacing
+    if tot <= 0.0:
+        return np.asarray(origin, dtype=np.float64) + (n / 2.0) * spacing
+    cx = float((w.sum(axis=(1, 2)) * (origin[0] + ax)).sum() / tot)
+    cy = float((w.sum(axis=(0, 2)) * (origin[1] + ax)).sum() / tot)
+    cz = float((w.sum(axis=(0, 1)) * (origin[2] + ax)).sum() / tot)
+    return np.array([cx, cy, cz], dtype=np.float64)
+
+
 def prepare_target(cube: np.ndarray, origin: np.ndarray, spacing: float,
                    centroid, ligand_radius: float,
                    protein_occupancy: np.ndarray | None = None,
-                   taper: float = 2.0):
+                   taper: float = 2.0, lowpass_sigma: float | None = None):
     """Soft-mask (+ optional protein-zero) the event-map cube, returning the
     POSITIVE masked target and its support mask.
 
@@ -187,9 +231,15 @@ def prepare_target(cube: np.ndarray, origin: np.ndarray, spacing: float,
 
     Mean-subtraction is NOT applied here: it is a Patterson-input requirement
     (kill the DC pedestal in the rotation function), whereas the translation /
-    Tanimoto step correlates positive densities. fit_conformer_sht mean-subtracts
+    Tanimoto step correlates positive densities. fit_conformer_crowther mean-subtracts
     a copy via patterson_input() for the rotation path only.
+
+    If ``lowpass_sigma`` is set, the cube is Gaussian-low-passed first to suppress
+    noise-dominated high frequencies (matched-filter / Wiener-lite; helps the
+    noise-squaring Patterson and matches the probe bandwidth).
     """
+    if lowpass_sigma:
+        cube = gaussian_lowpass(cube, spacing, lowpass_sigma)
     n = cube.shape[0]
     ax = (np.arange(n, dtype=np.float64) * spacing)
     gx = origin[0] + ax
@@ -234,11 +284,11 @@ def patterson_input(masked: np.ndarray, support: np.ndarray) -> np.ndarray:
 # fit_conformer_against(). The conformer's own density is the only thing built
 # per conformer, and it is built locally in the cube. This removes the
 # per-conformer x parallelism regeneration that the full-cell unmask path (and
-# the previous monolithic fit_conformer_sht) suffered from.
+# the previous monolithic fit_conformer_crowther) suffered from.
 
 
 @dataclass
-class ShtEventTarget:
+class CrowtherEventTarget:
     """Per-event FRF target: everything derived from the event/z map, computed
     once and reused across the event's conformers."""
     centre: np.ndarray           # event centroid, native Cartesian (A)
@@ -253,10 +303,11 @@ class ShtEventTarget:
 def prepare_event_target(
         target_grid: gemmi.FloatGrid,
         centroid,
-        pre: ShtPrecompute,
+        pre: CrowtherPrecompute,
         ligand_radius: float,
         protein_occupancy_grid: gemmi.FloatGrid | None = None,
-) -> ShtEventTarget:
+        lowpass_sigma: float | None = None,
+) -> CrowtherEventTarget:
     """Cut + preprocess + Patterson + SH-expand the event/z map ONCE per event.
 
     # HOLE 1 (target map): pass the event map or the z map as ``target_grid``.
@@ -274,13 +325,26 @@ def prepare_event_target(
     # tprep: positive masked target (translation/Tanimoto). pat_in: mean-
     # subtracted copy for the Patterson/rotation path only.
     tprep, support = prepare_target(
-        tcube, origin, spacing, centre, ligand_radius, prot_occ)
+        tcube, origin, spacing, centre, ligand_radius, prot_occ,
+        lowpass_sigma=lowpass_sigma)
     pat_in = patterson_input(tprep, support)
-    t_pat = rot.compute_patterson(pat_in)
     pat_origin = (-n / 2.0 * spacing * np.ones(3)).astype(np.float32)
-    pat_centre = np.zeros(3, dtype=np.float32)
-    t_spheres = rot.sample_density_on_spheres(
-        t_pat, pat_origin, spacing, pat_centre, pre.r, pre.theta, pre.phi)
+    if pre.config.use_patterson:
+        # Patterson rotation function (translation-invariant; for poor centroids)
+        t_src = rot.compute_patterson(pat_in)
+        t_spheres = rot.sample_density_on_spheres(
+            t_src, pat_origin, spacing, np.zeros(3, np.float32),
+            pre.r, pre.theta, pre.phi)
+    else:
+        # Direct density overlap (default): expand the mean-subtracted masked
+        # density on shells about the masked-density CENTRE OF MASS, not the raw
+        # event centroid. The COM is the true density centre regardless of
+        # centroid error, so the rotation is computed correctly even when the
+        # event centroid is off; the translation FFT then places the pose.
+        com = _density_com(tprep, origin, spacing)
+        t_spheres = rot.sample_density_on_spheres(
+            pat_in, origin.astype(np.float32), spacing,
+            com.astype(np.float32), pre.r, pre.theta, pre.phi)
     f_target = rot.sh_expand_fast(t_spheres, pre.Y_conj)
 
     # raw (un-Pattersoned) positive target for the translation FFT + Tanimoto
@@ -291,20 +355,20 @@ def prepare_event_target(
     else:
         F_protein_conj = np.zeros_like(F_target_conj)
 
-    del tcube, prot_occ, tprep, pat_in, t_pat, t_spheres, support
-    return ShtEventTarget(
+    del tcube, prot_occ, tprep, pat_in, t_spheres, support
+    return CrowtherEventTarget(
         centre=centre, origin=origin.astype(np.float64), pat_origin=pat_origin,
         f_target=f_target, F_target_conj=F_target_conj,
         target_self=target_self, F_protein_conj=F_protein_conj)
 
 
 def fit_conformer_against(
-        target: ShtEventTarget,
+        target: CrowtherEventTarget,
         conformer: gemmi.Structure,
-        pre: ShtPrecompute,
+        pre: CrowtherPrecompute,
         sigma: float | None = None,
 ):
-    """Per-conformer FRF search against a prepared ShtEventTarget. Only the
+    """Per-conformer FRF search against a prepared CrowtherEventTarget. Only the
     conformer's own density is built here, locally in the cube.
 
     Returns ``(optimized_structure, tanimoto, pose_centroid)``.
@@ -322,16 +386,21 @@ def fit_conformer_against(
     coords = coords - coords.mean(axis=0, keepdims=True)
     stamp, r_vox = vox.make_gaussian_stamp(sig, spacing)
 
-    # probe Patterson -> SH -> cross-correlation tensor -> all-rotation scores
+    # probe density -> shells -> SH; must match the target's rotation mode.
     probe0 = vox.voxelise_gaussian(coords + centre[None, :], origin, spacing,
                                    n, stamp, r_vox, weights=weights)
-    p_pat = rot.compute_patterson(probe0)
-    p_spheres = rot.sample_density_on_spheres(
-        p_pat, pat_origin, spacing, pat_centre, pre.r, pre.theta, pre.phi)
+    if cfg.use_patterson:
+        p_src = rot.compute_patterson(probe0)
+        p_spheres = rot.sample_density_on_spheres(
+            p_src, pat_origin, spacing, pat_centre, pre.r, pre.theta, pre.phi)
+    else:
+        p_spheres = rot.sample_density_on_spheres(
+            probe0, origin.astype(np.float32), spacing,
+            centre.astype(np.float32), pre.r, pre.theta, pre.phi)
     f_probe = rot.sh_expand_fast(p_spheres, pre.Y_conj)
     X_l = rot.cross_corr_tensor(target.f_target, f_probe, pre.r, pre.dr, cfg.L_max)
     scores = rot.score_all_rotations(X_l, pre.D_batch)
-    del probe0, p_pat, p_spheres, f_probe, X_l  # consumed
+    del probe0, p_spheres, f_probe, X_l  # consumed
 
     # top-K orientations -> translation FFT + clash Tanimoto
     top_k = min(cfg.top_k, cfg.n_rotations)
@@ -361,11 +430,11 @@ def fit_conformer_against(
     return optimized_structure, float(pose.tanimoto_at_best_combined), pose_centroid
 
 
-def fit_conformer_sht(
+def fit_conformer_crowther(
         centroid,
         conformer: gemmi.Structure,
         target_grid: gemmi.FloatGrid,
-        pre: ShtPrecompute,
+        pre: CrowtherPrecompute,
         ligand_radius: float,
         protein_occupancy_grid: gemmi.FloatGrid | None = None,
         sigma: float | None = None,
@@ -420,7 +489,7 @@ def _voxel_to_shift(voxel, n: int, spacing: float) -> np.ndarray:
     is unwrapped to a signed lag first (a peak past n/2 is a negative lag).
 
     Verified against a plant-and-recover round trip in
-    tests/test_sht_fit.py::test_translation_convention.
+    tests/test_crowther_fit.py::test_translation_convention.
     """
     v = np.asarray(voxel, dtype=np.int64)
     signed = ((v + n // 2) % n) - n // 2

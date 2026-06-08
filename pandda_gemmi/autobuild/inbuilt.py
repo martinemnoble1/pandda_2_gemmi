@@ -766,7 +766,7 @@ def transform_structure(structure, translation, rotation_matrix):
     return structure_copy
 
 
-def _score_conformer_sht(centroid_cart, conformer, score_build, z_grid,
+def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
                          raw_xmap_grid, res=None):
     """SH-Crowther FRF replacement for score_conformer's pose search.
 
@@ -775,8 +775,8 @@ def _score_conformer_sht(centroid_cart, conformer, score_build, z_grid,
     single resulting pose with ``score_build`` (the CNN) so the return value
     matches the DE path: (structure, score, centroid, arr).
     """
-    from .sht.fit import (
-        ShtConfig, get_precompute, fit_conformer_sht, sigma_from_resolution)
+    from .crowther.fit import (
+        CrowtherConfig, get_precompute, fit_conformer_crowther, sigma_from_resolution)
 
     # Bound the ligand: max heavy-atom distance from its centroid, + margin.
     coords = np.array(
@@ -791,8 +791,8 @@ def _score_conformer_sht(centroid_cart, conformer, score_build, z_grid,
     # sigma from dataset resolution (HOLE 6); precompute is sigma-independent so
     # the cache is unaffected. HOLE 3: no protein-occupancy grid yet (clash off).
     sigma = sigma_from_resolution(res) if res is not None else None
-    pre = get_precompute(ShtConfig())
-    optimized_structure, _tanimoto, _centroid = fit_conformer_sht(
+    pre = get_precompute(CrowtherConfig())
+    optimized_structure, _tanimoto, _centroid = fit_conformer_crowther(
         centroid_cart, conformer, z_grid, pre,
         ligand_radius=ligand_radius, sigma=sigma)
 
@@ -814,12 +814,12 @@ def score_conformer(
         res=None,
 ):
     # Experimental SH-Crowther FRF pose search (A/B against the DE search below).
-    # Toggle with PANDDA_SHT_FIT=1; env flag keeps the switch out of the call
+    # Toggle with PANDDA_CROWTHER_FIT=1; env flag keeps the switch out of the call
     # chain for the prototype. Uses the z map as the FRF target (HOLE 1) and
     # keeps score_build (the CNN) as the score arbiter, so the return contract
     # and everything downstream are unchanged.
-    if os.environ.get("PANDDA_SHT_FIT"):
-        return _score_conformer_sht(
+    if os.environ.get("PANDDA_CROWTHER_FIT"):
+        return _score_conformer_crowther(
             centroid_cart, conformer, score_build, z_grid, raw_xmap_grid, res)
 
     centered_structure = center_structure(
