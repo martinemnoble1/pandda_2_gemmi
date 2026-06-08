@@ -1605,6 +1605,102 @@ def get_contacts(
     ...
 
 
+def _translate_structure(st, vec):
+    """Return a clone of gemmi structure ``st`` shifted by Cartesian ``vec``."""
+    out = st.clone()
+    vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
+    for model in out:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    p = atom.pos
+                    atom.pos = gemmi.Position(p.x + vx, p.y + vy, p.z + vz)
+    return out
+
+
+def _autobuild_conformer_local(
+        centroid, event_bdc, conformer, masked_dtag_array, masked_mean_array,
+        reference_frame, out_dir, conformer_id, res, structure,
+        unmasked_dtag_array, unmasked_mean_array, z_array, raw_xmap_sparse,
+        score_build, raw_xmap_array_ref, n=96, spacing=0.5):
+    """Memory-light autobuild: cut local boxes from the sparse maps about the event
+    centroid (no full-cell unmask), fit with crowther + score with the CNN/BDC/
+    signal entirely in that local box, then map the pose back to the native frame.
+    Mirrors autobuild_conformer's outputs; result is frame-invariant since all
+    scores are translation-invariant."""
+    from .crowther.local import cut_local_grid_from_sparse
+
+    normalize_z = (z_array - np.mean(z_array)) / np.std(z_array)
+    normalize_xmap = (masked_dtag_array - np.mean(masked_dtag_array)) / np.std(masked_dtag_array)
+
+    # One local frame (box_origin is deterministic from centroid/n/spacing, so all
+    # cuts share it). z_local is the FRF target + CNN z-channel; the crowther fit
+    # ignores the score-grid arg, so z_local is reused for it.
+    z_local, box_origin = cut_local_grid_from_sparse(reference_frame, normalize_z, centroid, n, spacing)
+    rawx_local, _ = cut_local_grid_from_sparse(reference_frame, raw_xmap_sparse, centroid, n, spacing)
+    xmap_local, _ = cut_local_grid_from_sparse(reference_frame, masked_dtag_array, centroid, n, spacing)
+    dtag_local, _ = cut_local_grid_from_sparse(reference_frame, unmasked_dtag_array, centroid, n, spacing)
+    mean_local, _ = cut_local_grid_from_sparse(reference_frame, unmasked_mean_array, centroid, n, spacing)
+
+    centroid_local = np.asarray(centroid, dtype=np.float64) - box_origin
+    conf_local = _translate_structure(conformer.structure, -box_origin)
+
+    optimized_local, score, _cen, arr = score_conformer(
+        centroid_local, conf_local, z_local, score_build, z_local, rawx_local, res=res)
+
+    predicted_mask = get_predicted_mask(optimized_local, xmap_local)
+    predicted_mask_array = np.array(predicted_mask, copy=False)
+    predicted_density = get_predicted_density(optimized_local, xmap_local)
+    predicted_density_array = np.array(predicted_density, copy=False)
+    try:
+        high = get_predicted_density_high_contour(predicted_density, predicted_mask)
+    except Exception:
+        high = 1.0
+
+    # BDC by maximising calc-vs-event correlation over the ligand mask, on local grids
+    da = np.array(dtag_local, copy=False)
+    me = np.array(mean_local, copy=False)
+    sel = predicted_mask_array >= 2
+    if int(sel.sum()) > 0:
+        rr = optimize.differential_evolution(
+            lambda b: get_correlation(b, da[sel], me[sel], predicted_density_array[sel]),
+            [(0.0, 0.95)])
+        corr = 1 - rr.fun
+        bdc = float(rr.x[0])
+    else:
+        corr, bdc = 0.0, float(event_bdc)
+
+    corrected = (da - bdc * me) / (1 - bdc)
+    signal_vals = get_signal(corrected, predicted_density_array > high)
+    noise_signal_vals = get_signal(corrected, predicted_mask_array == 1)
+    try:
+        optimal_signal_contour = get_optimal_signal_contour(signal_vals, noise_signal_vals)
+    except Exception:
+        optimal_signal_contour = 1.0
+
+    optimized_native = _translate_structure(optimized_local, box_origin)
+    num_contacts = get_contacts(optimized_native, structure.structure)
+    noise_signal_vals = np.clip(noise_signal_vals, 0.0, 3.0)
+    signal_vals = np.clip(signal_vals, 0.0, 3.0)
+    save_structure(Structure(None, optimized_native), out_dir / f"{conformer_id}.pdb")
+    centroid_native = get_structure_mean(optimized_native)
+
+    return {
+        str(out_dir / f"{conformer_id}.pdb"): {
+            'score': float(score),
+            'centroid': centroid_native,
+            'local_signal': float(corr),
+            'new_bdc': float(bdc),
+            'noise': float(np.abs(np.sum(noise_signal_vals))),
+            'signal': float(np.abs(np.sum(signal_vals))),
+            'num_points': int(np.sum(predicted_density_array > high)),
+            'optimal_contour': float(optimal_signal_contour),
+            'num_contacts': int(num_contacts),
+            'arr': arr,
+        }
+    }
+
+
 def autobuild_conformer(
         centroid,
         event_bdc,
@@ -1623,6 +1719,15 @@ def autobuild_conformer(
         score_build,
         raw_xmap_array_ref
 ):
+    # Path X: when crowther fitting is on, run the whole build on LOCAL boxes cut
+    # from the sparse maps (no full-cell unmask) -> cell-size-independent memory.
+    if os.environ.get("PANDDA_CROWTHER_FIT"):
+        return _autobuild_conformer_local(
+            centroid, event_bdc, conformer, masked_dtag_array, masked_mean_array,
+            reference_frame, out_dir, conformer_id, res, structure,
+            unmasked_dtag_array, unmasked_mean_array, z_array, raw_xmap_sparse,
+            score_build, raw_xmap_array_ref)
+
     time_begin_autobuild = time.time()
 
     # event_map_grid = reference_frame.unmask(SparseDMap((masked_dtag_array - (event_bdc*masked_mean_array)) / (1-event_bdc)))
