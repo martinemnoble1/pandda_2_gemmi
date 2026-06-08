@@ -1632,11 +1632,17 @@ def _autobuild_conformer_local(
 
     normalize_z = (z_array - np.mean(z_array)) / np.std(z_array)
     normalize_xmap = (masked_dtag_array - np.mean(masked_dtag_array)) / np.std(masked_dtag_array)
+    # The DE fit's score-grid target (same construction as the full path), built
+    # sparsely so it can be cut locally -- needed so DE+local works (the
+    # behaviour-preserving control); the crowther fit ignores it.
+    score_grid_sparse = np.zeros(normalize_z.shape, dtype=np.float32)
+    score_grid_sparse[normalize_xmap > 1.5] = 0.5
+    score_grid_sparse[normalize_z > 1.5] = 1.0
 
     # One local frame (box_origin is deterministic from centroid/n/spacing, so all
-    # cuts share it). z_local is the FRF target + CNN z-channel; the crowther fit
-    # ignores the score-grid arg, so z_local is reused for it.
+    # cuts share it).
     z_local, box_origin = cut_local_grid_from_sparse(reference_frame, normalize_z, centroid, n, spacing)
+    event_local, _ = cut_local_grid_from_sparse(reference_frame, score_grid_sparse, centroid, n, spacing)
     rawx_local, _ = cut_local_grid_from_sparse(reference_frame, raw_xmap_sparse, centroid, n, spacing)
     xmap_local, _ = cut_local_grid_from_sparse(reference_frame, masked_dtag_array, centroid, n, spacing)
     dtag_local, _ = cut_local_grid_from_sparse(reference_frame, unmasked_dtag_array, centroid, n, spacing)
@@ -1645,8 +1651,10 @@ def _autobuild_conformer_local(
     centroid_local = np.asarray(centroid, dtype=np.float64) - box_origin
     conf_local = _translate_structure(conformer.structure, -box_origin)
 
+    # score_conformer picks crowther vs DE via PANDDA_CROWTHER_FIT; event_local is
+    # the DE target (crowther ignores it), z_local/rawx_local the crowther + CNN maps.
     optimized_local, score, _cen, arr = score_conformer(
-        centroid_local, conf_local, z_local, score_build, z_local, rawx_local, res=res)
+        centroid_local, conf_local, event_local, score_build, z_local, rawx_local, res=res)
 
     predicted_mask = get_predicted_mask(optimized_local, xmap_local)
     predicted_mask_array = np.array(predicted_mask, copy=False)
@@ -1719,9 +1727,13 @@ def autobuild_conformer(
         score_build,
         raw_xmap_array_ref
 ):
-    # Path X: when crowther fitting is on, run the whole build on LOCAL boxes cut
-    # from the sparse maps (no full-cell unmask) -> cell-size-independent memory.
-    if os.environ.get("PANDDA_CROWTHER_FIT"):
+    # Path X: PANDDA_LOCAL_AUTOBUILD runs the whole build on LOCAL boxes cut from
+    # the sparse maps (no full-cell unmask) -> cell-size-independent memory. It is
+    # INDEPENDENT of the fit method: inside, score_conformer still picks crowther
+    # vs DE via PANDDA_CROWTHER_FIT. So the 2x2 (DE/crowther x full/local) is
+    # runnable -- in particular DE+local isolates and validates the memory cut as
+    # behaviour-preserving, separate from the crowther fit change.
+    if os.environ.get("PANDDA_LOCAL_AUTOBUILD"):
         return _autobuild_conformer_local(
             centroid, event_bdc, conformer, masked_dtag_array, masked_mean_array,
             reference_frame, out_dir, conformer_id, res, structure,
