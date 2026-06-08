@@ -766,6 +766,42 @@ def transform_structure(structure, translation, rotation_matrix):
     return structure_copy
 
 
+def _score_conformer_sht(centroid_cart, conformer, score_build, z_grid,
+                         raw_xmap_grid, res=None):
+    """SH-Crowther FRF replacement for score_conformer's pose search.
+
+    Places ``conformer`` into the z-map density about ``centroid_cart`` via the
+    Patterson rotation function + clash-penalised translation, then scores the
+    single resulting pose with ``score_build`` (the CNN) so the return value
+    matches the DE path: (structure, score, centroid, arr).
+    """
+    from .sht.fit import (
+        ShtConfig, get_precompute, fit_conformer_sht, sigma_from_resolution)
+
+    # Bound the ligand: max heavy-atom distance from its centroid, + margin.
+    coords = np.array(
+        [[a.pos.x, a.pos.y, a.pos.z]
+         for model in conformer for chain in model for res in chain
+         for a in res if a.element.name != "H"],
+        dtype=np.float64,
+    )
+    ligand_radius = float(np.linalg.norm(
+        coords - coords.mean(axis=0), axis=1).max()) + 2.0
+
+    # sigma from dataset resolution (HOLE 6); precompute is sigma-independent so
+    # the cache is unaffected. HOLE 3: no protein-occupancy grid yet (clash off).
+    sigma = sigma_from_resolution(res) if res is not None else None
+    pre = get_precompute(ShtConfig())
+    optimized_structure, _tanimoto, _centroid = fit_conformer_sht(
+        centroid_cart, conformer, z_grid, pre,
+        ligand_radius=ligand_radius, sigma=sigma)
+
+    # Keep the CNN as the arbiter (HOLE 1): score the single FRF pose.
+    score, arr = score_build(optimized_structure, z_grid, raw_xmap_grid)
+    return (optimized_structure, float(score),
+            get_structure_mean(optimized_structure), arr)
+
+
 def score_conformer(
         centroid_cart,
         conformer,
@@ -775,8 +811,17 @@ def score_conformer(
             raw_xmap_grid,
         #event_fit_num_trys=6,
         event_fit_num_trys=12,
-
+        res=None,
 ):
+    # Experimental SH-Crowther FRF pose search (A/B against the DE search below).
+    # Toggle with PANDDA_SHT_FIT=1; env flag keeps the switch out of the call
+    # chain for the prototype. Uses the z map as the FRF target (HOLE 1) and
+    # keeps score_build (the CNN) as the score arbiter, so the return contract
+    # and everything downstream are unchanged.
+    if os.environ.get("PANDDA_SHT_FIT"):
+        return _score_conformer_sht(
+            centroid_cart, conformer, score_build, z_grid, raw_xmap_grid, res)
+
     centered_structure = center_structure(
         conformer,
         centroid_cart,
@@ -1609,6 +1654,7 @@ def autobuild_conformer(
         score_build,
         z_grid,
         raw_xmap_grid,
+        res=res,
     )
     time_finish_score_conf = time.time()
 
