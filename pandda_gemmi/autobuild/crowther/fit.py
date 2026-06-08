@@ -46,21 +46,21 @@ class CrowtherConfig:
     """FRF fit parameters.
 
     Memory note: the dominant resident allocation is the Wigner-D batch
-    (``n_rotations`` x sum_l (2l+1)^2 complex64), which is per-worker and shared
-    across all conformers -- 261.8 MB at L=16/N=5000, 2.3 MB at L=8/N=300 (114x).
-    It is deliberately NOT freed per conformer (it is the amortisation). So
-    ``n_rotations`` and ``L_max`` are the real per-worker memory levers; per-fit
-    transients (~31 MB at grid=64) are freed on return. FINDINGS sec.6 reports a
-    structured N~128/L=8 cover matching random N~300 on recall@10 -- see
-    CrowtherConfig.lean(). The per-fit peak scales with grid^3 (cut to grid=32 = 8x
-    less if needed)."""
+    (``n_rotations`` x sum_l (2l+1)^2 complex64), per-worker and shared across all
+    conformers -- ~15 MB at the L=8/N=2000 default (261.8 MB at the old L=16/N=5000,
+    2.3 MB at L=8/N=300). NOT freed per conformer (it is the amortisation), so
+    ``n_rotations`` and ``L_max`` are the per-worker memory levers; per-fit
+    transients (~31 MB at grid=64) are freed on return. CrowtherConfig.lean() drops
+    N to 300. The per-fit peak scales with grid^3 (cut to grid=32 = 8x less)."""
     grid: int = 64               # power of 2 (radix-2 FFT)
     spacing: float = 0.5         # A, isotropic
-    L_max: int = 16              # SH band limit (<= ~20 in fp64)
-    n_r: int = 16                # radial shells
-    n_rotations: int = 5000      # SO(3) sample count
-    sigma: float = 1.0           # probe Gaussian width; HOLE 6: set from dataset res
-    top_k: int = 20              # orientations carried to the translation step
+    L_max: int = 8               # SH band limit; L-sweep showed L=8==L=16 on
+                                 # real data (FRF<->brute 0.00 at all L) -> lean
+    n_r: int = 14                # radial shells
+    n_rotations: int = 2000      # SO(3) sample count (validated; denser doesn't
+                                 # help direct-density, can pick a symmetry alias)
+    sigma: float = 1.0           # probe Gaussian width; set from dataset res
+    top_k: int = 30              # orientations carried to the translation step
     lambda_clash: float = 0.0    # HOLE 3: clash weight (0 disables)
     headroom: float = 2.5        # Patterson clean-box: cube edge >= headroom x span
     rotation_seed: int = 42
