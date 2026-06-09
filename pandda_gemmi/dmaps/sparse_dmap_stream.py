@@ -90,8 +90,9 @@ class SparseDMapStream:
         # Get the shape to load datasets into
         shape = (len(self.datasets), self.dframe.mask.indicies[0].size)
 
-        # Get the array
-        array = np.zeros(shape)
+        # Get the array (float32 -- the maps are f32; np.zeros defaults to f64
+        # and would gratuitously double this datasets x voxels matrix).
+        array = np.zeros(shape, dtype=np.float32)
 
         # Load each dataset in
         for j, dtag in enumerate(self.datasets):

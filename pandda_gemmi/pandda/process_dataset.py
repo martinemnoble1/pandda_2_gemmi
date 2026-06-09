@@ -49,6 +49,39 @@ from pandda_gemmi.autobuild.inbuilt import mask_dmap, get_conformers, autobuild_
 from pandda_gemmi.plots import plot_aligned_density_projection
 from pandda_gemmi import serialize
 
+
+def _memtrace(stage):
+    """Lightweight per-stage memory trace, gated by PANDDA_MEMTRACE. Logs
+    system-wide used RAM (captures Ray workers + plasma, i.e. what the OOM killer
+    sees) plus this process's RSS, flushed per line so the last line survives a
+    SIGKILL. Used to pinpoint the large-cell OOM stage."""
+    if not os.environ.get("PANDDA_MEMTRACE"):
+        return
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        p = psutil.Process()
+        rss = p.memory_info().rss
+        children = 0.0
+        for c in p.children(recursive=True):
+            try:
+                children += c.memory_info().rss
+            except psutil.Error:
+                pass
+        store = ""
+        try:
+            import ray
+            if ray.is_initialized():
+                store = f"\tray_obj_store_gb={ray._private.utils.get_used_object_store_memory()/1e9:.2f}"
+        except Exception:
+            pass
+        print(f"MEMTRACE\t{stage}\tsys_used_gb={vm.used/1e9:.1f}"
+              f"\tsys_avail_gb={vm.available/1e9:.1f}\tself_rss_gb={rss/1e9:.2f}"
+              f"\tchildren_rss_gb={children/1e9:.2f}{store}", flush=True)
+    except Exception as e:
+        print(f"MEMTRACE\t{stage}\t(failed: {e})", flush=True)
+
+
 def read_dataset(fs, dtag):
     pandda_events = {}
     autobuilds = {}
@@ -88,6 +121,7 @@ def process_dataset(
     autobuilds = {}
     # Record the time that dataset processing begins
     time_begin_process_dataset = time.time()
+    _memtrace(f"{dtag} 0_dataset_start")
 
     # Handle the case in which the dataset has already been processed
     # TODO: log properly
@@ -200,6 +234,8 @@ def process_dataset(
         }
     )
     dmaps = np.vstack([_dmap.data.reshape((1, -1)) for _dtag, _dmap in dmaps_dict.items()])
+    _memtrace(f"{dtag} 1_dmaps_built n_comp={dmaps.shape[0]} n_pts={dmaps.shape[1]} "
+              f"dtype={dmaps.dtype} gb={dmaps.nbytes/1e9:.2f}")
     if args.debug:
         print('Aligned dmap stats')
         for _dtag, _dmap in dmaps_dict.items():
@@ -214,6 +250,7 @@ def process_dataset(
     dtag_index = np.argwhere(dtag_array == dtag)
     dataset_dmap_array = dmaps[dtag_index[0][0], :]
     xmap_grid = reference_frame.unmask(SparseDMap(dataset_dmap_array))
+    _memtrace(f"{dtag} 2_unmask_xmap (full-cell dense grid)")
     raw_xmap_grid = dataset.reflections.transform_f_phi_to_map(sample_rate=3)
     raw_xmap_sparse = reference_frame.mask_grid(raw_xmap_grid).data
     raw_xmap_sparse_ref = processor.put(raw_xmap_sparse)
@@ -239,6 +276,7 @@ def process_dataset(
         )
     )
     time_finish_get_characterization_sets = time.time()
+    _memtrace(f"{dtag} 3_characterization_sets n_sets={len(characterization_sets)}")
     # TODO: Log properly
     print(
         f"\t\tGot characterization sets in: {round(time_finish_get_characterization_sets - time_begin_get_characterization_sets, 2)}")
@@ -256,6 +294,8 @@ def process_dataset(
         process_all=process_all
     )
     # print(f"Models to process are {models_to_process} out of {[x for x in characterization_sets]}")
+
+    _memtrace(f"{dtag} 4_filter_models n_models={len(models_to_process)}")
 
     # Plot the projections
     umap_plot_out_dir = fs.output.processed_datasets[dtag] / "model_umap"
@@ -319,12 +359,14 @@ def process_dataset(
         model_metas[model_number] = result[4]
 
     time_finish_process_models = time.time()
+    _memtrace(f"{dtag} 5_process_models_done")
     # TODO: Log properly
     # print(f"\t\tProcessed all models in: {round(time_finish_process_models - time_begin_process_models, 2)}")
 
     if args.use_ligand_data & args.autobuild:
         # Build the events
         time_begin_autobuild = time.time()
+        _memtrace(f"{dtag} 6_autobuild_start")
 
         # Get the Masked processed dtag dmap array and cache
         masked_dtag_array = mask_dmap(np.copy(dataset_dmap_array), dataset.structure.structure, reference_frame)
@@ -405,6 +447,7 @@ def process_dataset(
             }
         )
         time_finish_autobuild = time.time()
+        _memtrace(f"{dtag} 7_autobuild_done")
         # TODO: Log properly
         # print(f"\t\tAutobuilt in {time_finish_autobuild - time_begin_autobuild}")
 
