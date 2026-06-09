@@ -367,11 +367,16 @@ def fit_conformer_against(
         conformer: gemmi.Structure,
         pre: CrowtherPrecompute,
         sigma: float | None = None,
+        n_candidates: int = 1,
 ):
     """Per-conformer FRF search against a prepared CrowtherEventTarget. Only the
     conformer's own density is built here, locally in the cube.
 
-    Returns ``(optimized_structure, tanimoto, pose_centroid)``.
+    With ``n_candidates == 1`` (default) returns the single Tanimoto-best
+    ``(optimized_structure, tanimoto, pose_centroid)``. With ``n_candidates > 1``
+    returns a list of the top-N such tuples (by Tanimoto) so the caller can
+    re-rank them with a different objective (e.g. CNN-arbitrate, matching the DE
+    path's best-of-N-by-CNN behaviour).
     """
     cfg = pre.config
     n, spacing = cfg.grid, cfg.spacing
@@ -402,11 +407,10 @@ def fit_conformer_against(
     scores = rot.score_all_rotations(X_l, pre.D_batch)
     del probe0, p_spheres, f_probe, X_l  # consumed
 
-    # top-K orientations -> translation FFT + clash Tanimoto
+    # top-K orientations -> translation FFT + clash Tanimoto; collect candidates
     top_k = min(cfg.top_k, cfg.n_rotations)
     top_idx = np.argpartition(-scores, top_k - 1)[:top_k]
-    best = None
-    best_combined = -np.inf
+    cands = []
     for idx in top_idx:
         R = pre.Rs_mat[idx]
         rot_coords = coords @ R.T + centre[None, :]
@@ -417,17 +421,21 @@ def fit_conformer_against(
         pose = refine_translation_with_clash(
             F_p, target.F_target_conj, target.F_protein_conj,
             target.target_self, probe_self, cfg.lambda_clash, n)
-        if pose.combined > best_combined:
-            best_combined = pose.combined
-            best = (R, pose)
+        cands.append((pose.combined, R, pose))
 
-    R, pose = best
-    shift = _voxel_to_shift(pose.best_translation_voxel, n, spacing)
-    final_coords = coords @ R.T + centre[None, :] + shift[None, :]
+    cands.sort(key=lambda c: c[0], reverse=True)
 
-    optimized_structure = _place_structure(conformer, final_coords)
-    pose_centroid = tuple(final_coords.mean(axis=0))
-    return optimized_structure, float(pose.tanimoto_at_best_combined), pose_centroid
+    def _place(R, pose):
+        shift = _voxel_to_shift(pose.best_translation_voxel, n, spacing)
+        fc = coords @ R.T + centre[None, :] + shift[None, :]
+        return (_place_structure(conformer, fc),
+                float(pose.tanimoto_at_best_combined),
+                tuple(fc.mean(axis=0)))
+
+    if n_candidates <= 1:
+        _c, R, pose = cands[0]
+        return _place(R, pose)
+    return [_place(R, pose) for _c, R, pose in cands[:n_candidates]]
 
 
 def fit_conformer_crowther(

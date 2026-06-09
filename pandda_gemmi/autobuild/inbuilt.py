@@ -767,16 +767,21 @@ def transform_structure(structure, translation, rotation_matrix):
 
 
 def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
-                         raw_xmap_grid, res=None):
+                         raw_xmap_grid, res=None, n_cnn_candidates=8):
     """SH-Crowther FRF replacement for score_conformer's pose search.
 
-    Places ``conformer`` into the z-map density about ``centroid_cart`` via the
-    Patterson rotation function + clash-penalised translation, then scores the
-    single resulting pose with ``score_build`` (the CNN) so the return value
-    matches the DE path: (structure, score, centroid, arr).
+    The FRF ranks orientations by Tanimoto, but the DE path it replaces keeps the
+    pose with the best *CNN* score (best of 12), and the downstream event
+    selection ranks on that CNN score. Scoring only the single Tanimoto-best pose
+    therefore under-scores crowther builds vs DE and gets them filtered out (the
+    observed coverage regression). So we take the FRF's top-N candidate poses,
+    CNN-score each, and return the best-CNN one -- matching the DE path's metric
+    so crowther builds compete fairly in selection. Returns
+    (structure, cnn_score, centroid, arr).
     """
     from .crowther.fit import (
-        CrowtherConfig, get_precompute, fit_conformer_crowther, sigma_from_resolution)
+        CrowtherConfig, get_precompute, prepare_event_target,
+        fit_conformer_against, sigma_from_resolution)
 
     # Bound the ligand: max heavy-atom distance from its centroid, + margin.
     coords = np.array(
@@ -792,14 +797,19 @@ def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
     # the cache is unaffected. HOLE 3: no protein-occupancy grid yet (clash off).
     sigma = sigma_from_resolution(res) if res is not None else None
     pre = get_precompute(CrowtherConfig())
-    optimized_structure, _tanimoto, _centroid = fit_conformer_crowther(
-        centroid_cart, conformer, z_grid, pre,
-        ligand_radius=ligand_radius, sigma=sigma)
+    target = prepare_event_target(
+        z_grid, centroid_cart, pre, ligand_radius=ligand_radius)
+    candidates = fit_conformer_against(
+        target, conformer, pre, sigma=sigma, n_candidates=n_cnn_candidates)
 
-    # Keep the CNN as the arbiter (HOLE 1): score the single FRF pose.
-    score, arr = score_build(optimized_structure, z_grid, raw_xmap_grid)
-    return (optimized_structure, float(score),
-            get_structure_mean(optimized_structure), arr)
+    # CNN-arbitrate the top-N FRF candidates: keep the best-CNN pose.
+    best = None
+    for struct, _tani, _cen in candidates:
+        score, arr = score_build(struct, z_grid, raw_xmap_grid)
+        if best is None or float(score) > best[1]:
+            best = (struct, float(score), arr)
+    struct, score, arr = best
+    return (struct, score, get_structure_mean(struct), arr)
 
 
 def score_conformer(
