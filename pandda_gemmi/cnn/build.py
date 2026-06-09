@@ -141,8 +141,6 @@ class BuildScorer:
         #     f'Build Score mask: {round(np.min(arr[0][2]), 3)} {round(np.median(arr[0][2]), 3)} {round(np.max(arr[0][2]), 3)} {round(np.sum(arr[0][2]), 3)}\n'
         #
         # )
-        return self.model(
-            torch.from_numpy(
-                arr
-            )
-        ).detach().numpy(), arr
+        with torch.no_grad():
+            out = self.model(torch.from_numpy(arr)).detach().numpy()
+        return out, arr
