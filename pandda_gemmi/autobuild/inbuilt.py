@@ -310,6 +310,20 @@ def get_structures_from_mol(mol: Chem.Mol, dataset_cif_path, max_conformers):
     return fragment_structures
 
 
+def _max_ligand_heavy_atoms():
+    # A fragment-screening ligand is a small molecule (typically < ~50 heavy
+    # atoms; a ~15-residue peptide is still < 150). Anything far above this is
+    # not a ligand -- almost always a model/protein file mis-detected as one via
+    # a permissive ligand regex. Building it as a fragment is meaningless and, on
+    # a large complex, exhausts memory (it OOM'd a 128 GB box). Tunable.
+    return int(os.environ.get("PANDDA_MAX_LIGAND_ATOMS", 150))
+
+
+def _structure_heavy_atom_count(st):
+    return sum(1 for model in st for chain in model for residue in chain
+               for atom in residue if atom.element.name != "H")
+
+
 def get_conformers(
         ligand_files: LigandFilesInterface,
         pruning_threshold=1.5,
@@ -320,6 +334,19 @@ def get_conformers(
 
     if ligand_files.ligand_cif is not None:
         mol = get_fragment_mol_from_dataset_cif_path(ligand_files.ligand_cif)
+
+        # Guard: refuse to treat a non-fragment (e.g. a whole protein/model
+        # mis-detected as a ligand) as a buildable ligand -- before the
+        # expensive conformer embedding. See _max_ligand_heavy_atoms.
+        if mol is None:
+            return {}
+        n_heavy = mol.GetNumHeavyAtoms()
+        if n_heavy > _max_ligand_heavy_atoms():
+            print(f"Ligand from {ligand_files.ligand_cif.name} has {n_heavy} heavy "
+                  f"atoms (> {_max_ligand_heavy_atoms()} fragment limit): skipping. "
+                  f"This is almost certainly a model/protein file mis-detected as a "
+                  f"ligand (check your --ligand_cif_regex / --ligand_pdb_regex).")
+            return {}
 
         # Generate conformers
         # mol.CalcImplicitValence()
@@ -365,7 +392,20 @@ def get_conformers(
     if ligand_files.ligand_pdb is not None:
         # print(f"\t\t\tGetting conformers from: {ligand_files.ligand_pdb}")
 
-        fragment_structures = {0: load_structure(ligand_files.ligand_pdb), }
+        st = load_structure(ligand_files.ligand_pdb)
+        st = getattr(st, "structure", st)
+
+        # Same guard for the pdb path: a whole-protein "ligand" pdb is not a
+        # fragment and must not be built/docked (memory blow-up on large cells).
+        n_heavy = _structure_heavy_atom_count(st)
+        if n_heavy > _max_ligand_heavy_atoms():
+            print(f"Ligand from {ligand_files.ligand_pdb.name} has {n_heavy} heavy "
+                  f"atoms (> {_max_ligand_heavy_atoms()} fragment limit): skipping. "
+                  f"This is almost certainly a model/protein file mis-detected as a "
+                  f"ligand (check your --ligand_pdb_regex).")
+            return {}
+
+        fragment_structures = {0: st, }
 
         return fragment_structures
 
