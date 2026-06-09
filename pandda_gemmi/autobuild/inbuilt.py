@@ -310,6 +310,16 @@ def get_structures_from_mol(mol: Chem.Mol, dataset_cif_path, max_conformers):
     return fragment_structures
 
 
+def _de_seed():
+    """Optional fixed RNG seed for the stochastic autobuild steps
+    (differential_evolution + RDKit conformer embedding), from PANDDA_DE_SEED.
+    Returns int when set, else None (scipy/RDKit default = unseeded). Setting it
+    makes autobuild deterministic so e.g. local-grid vs full-grid runs can be
+    compared without the DE-randomness confound."""
+    v = os.environ.get("PANDDA_DE_SEED")
+    return int(v) if v not in (None, "") else None
+
+
 def _max_ligand_heavy_atoms():
     # A fragment-screening ligand is a small molecule (typically < ~50 heavy
     # atoms; a ~15-residue peptide is still < 150). Anything far above this is
@@ -357,6 +367,7 @@ def get_conformers(
             mol,
             numConfs=num_pose_samples,
             pruneRmsThresh=pruning_threshold,
+            randomSeed=(_de_seed() if _de_seed() is not None else -1),
         )
 
         # Translate to structures
@@ -997,6 +1008,7 @@ def score_conformer(
                 (-6.0, 6.0), (-6, 6.0), (-6.0, 6.0),
                 (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)
             ],
+            seed=_de_seed(),
             # popsize=30,
         )
         # res = optimize.shgo(
@@ -1571,6 +1583,7 @@ def get_local_signal_dencalc_optimize_bdc(
             masked_calc_vals,
         ),
         [(0.0, 0.95), ],
+        seed=_de_seed(),
         # popsize=30,
     )
 
@@ -1818,7 +1831,7 @@ def _autobuild_conformer_local(
     if int(sel.sum()) > 0:
         rr = optimize.differential_evolution(
             lambda b: get_correlation(b, da[sel], me[sel], predicted_density_array[sel]),
-            [(0.0, 0.95)])
+            [(0.0, 0.95)], seed=_de_seed())
         corr = 1 - rr.fun
         bdc = float(rr.x[0])
     else:
