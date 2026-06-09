@@ -91,11 +91,28 @@ class LigandFiles:
         self.ligand_pdb = ligand_pdb
 
 
-def parse_dir_ligands(path: Path, ligand_cif_regex, ligand_smiles_regex, ligand_pdb_regex, check_input):
+def parse_dir_ligands(path: Path, ligand_cif_regex, ligand_smiles_regex, ligand_pdb_regex, check_input, exclude=None):
+    # Resolved paths that must never be treated as ligands (e.g. the dataset's
+    # own model pdb / reflections mtz). In a flat layout the model pdb lives
+    # beside the ligand files and can otherwise be globbed as a "ligand pdb"
+    # (a whole-protein "ligand"), which then loses every event to the
+    # symmetry-clash build filter. See get_input_ligands.
+    exclude_resolved = set()
+    for p in (exclude or ()):
+        try:
+            exclude_resolved.add(p.resolve())
+        except (OSError, AttributeError):
+            pass
     ligand_keys = {}
     for file_path in path.glob("*"):
         name = file_path.name
         stem = file_path.stem
+
+        try:
+            if file_path.resolve() in exclude_resolved:
+                continue
+        except OSError:
+            pass
 
         # Ignore some common names
         skip = False
@@ -152,7 +169,7 @@ def parse_dir_ligands(path: Path, ligand_cif_regex, ligand_smiles_regex, ligand_
     return ligand_keys
 
 
-def get_input_ligands(path: Path, ligand_dir_regex, ligand_cif_regex, ligand_smiles_regex, ligand_pdb_regex, check_input):
+def get_input_ligands(path: Path, ligand_dir_regex, ligand_cif_regex, ligand_smiles_regex, ligand_pdb_regex, check_input, exclude=None):
     path_ligands = {}
 
     # First, look for ligand files directly in the dataset directory (a "flat"
@@ -166,6 +183,7 @@ def get_input_ligands(path: Path, ligand_dir_regex, ligand_cif_regex, ligand_smi
             ligand_smiles_regex,
             ligand_pdb_regex,
             check_input,
+            exclude=exclude,
     ).items():
         path_ligands[ligand_key] = ligand_files
 
@@ -185,7 +203,8 @@ def get_input_ligands(path: Path, ligand_dir_regex, ligand_cif_regex, ligand_smi
                 ligand_cif_regex,
                 ligand_smiles_regex,
                 ligand_pdb_regex,
-                check_input
+                check_input,
+                exclude=exclude,
             )
             # print(f"Matched ligand dir with {len(ligand_dir_ligands)} ligands!!")
             # path_ligands.update(ligand_dir_ligands)
@@ -229,14 +248,17 @@ class DatasetDir:
         # Get mtz
         self.input_mtz_file = get_input_mtz_file(path, mtz_regex, check_input)
 
-        # Get the ligands
+        # Get the ligands, excluding the dataset's own model pdb / reflections
+        # mtz so a flat-layout model file is never ingested as a "ligand".
         self.input_ligands = get_input_ligands(
             path,
             ligand_dir_regex,
             ligand_cif_regex,
             ligand_smiles_regex,
             ligand_pdb_regex,
-            check_input
+            check_input,
+            exclude=[p for p in (self.input_pdb_file, self.input_mtz_file)
+                     if p is not None],
         )
 
         self.path = path
