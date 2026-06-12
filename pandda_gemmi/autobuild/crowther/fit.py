@@ -505,20 +505,33 @@ def _voxel_to_shift(voxel, n: int, spacing: float) -> np.ndarray:
 
 
 def _place_structure(conformer: gemmi.Structure, coords: np.ndarray) -> gemmi.Structure:
-    """Clone ``conformer`` and set its heavy-atom positions to ``coords`` (native
-    Cartesian A -- no inverse-cell transform needed, the cube was in native
-    frame). Visits atoms in the same order as _heavy_atoms."""
+    """Clone ``conformer`` and move it so its heavy atoms land on ``coords``
+    (native Cartesian A, same order as _heavy_atoms). ``coords`` is a rigid
+    transform of the conformer's heavy atoms, so recover that transform by
+    Kabsch and apply it to ALL atoms -- crucially the hydrogens too. (Setting
+    only the heavy positions and skipping H left the H stranded at their
+    embedded origin, dragging the all-atom centroid off the event and corrupting
+    the CNN ligand mask.)"""
     st = conformer.clone()
-    k = 0
+    orig = np.array(
+        [[a.pos.x, a.pos.y, a.pos.z]
+         for model in st for chain in model for residue in chain
+         for a in residue if a.element.name != "H"], dtype=np.float64)
+    if orig.shape[0] != coords.shape[0]:
+        raise ValueError(f"atom-order mismatch: {orig.shape[0]} vs {coords.shape[0]}")
+
+    oc = orig.mean(axis=0)
+    cc = coords.mean(axis=0)
+    H = (orig - oc).T @ (coords - cc)
+    U, S, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T   # coords ~= (orig-oc) @ R.T + cc
+
     for model in st:
         for chain in model:
             for residue in chain:
                 for atom in residue:
-                    if atom.element.name == "H":
-                        continue
-                    x, y, z = coords[k]
-                    atom.pos = gemmi.Position(float(x), float(y), float(z))
-                    k += 1
-    if k != coords.shape[0]:
-        raise ValueError(f"atom-order mismatch: placed {k} of {coords.shape[0]}")
+                    p = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
+                    q = (p - oc) @ R.T + cc
+                    atom.pos = gemmi.Position(float(q[0]), float(q[1]), float(q[2]))
     return st

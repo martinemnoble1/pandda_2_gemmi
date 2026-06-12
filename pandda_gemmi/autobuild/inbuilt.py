@@ -607,75 +607,102 @@ def transform_structure(structure, translation, rotation_matrix):
     return structure_copy
 
 
-def _refine_pose_on_cnn(seed, score_build, z_grid, raw_xmap_grid, maxfev=40):
-    """6-DOF derivative-free (Nelder-Mead) refinement of a seed pose against the
-    *build CNN* objective. Rotation (rotvec) about the seed's heavy-atom centroid
-    + translation. The CNN is the only objective that tracks build quality (RSCC
-    /Tanimoto are not usable proxies -- they even anti-correlate locally), so we
-    optimise it directly; a good FRF seed means Nelder-Mead converges in ~40
-    evals, vs DE paying for a global 6-D search from scratch. Returns
-    (refined_structure, cnn_score, arr)."""
-    step = np.array([0.1, 0.1, 0.1, 0.5, 0.5, 0.5])
-    simplex = np.vstack([np.zeros(6)] + [np.eye(6)[i] * step[i] for i in range(6)])
-    hv = np.array(
-        [[a.pos.x, a.pos.y, a.pos.z]
-         for model in seed for chain in model for r in chain
-         for a in r if a.element.name != "H"], dtype=np.float64)
-    c0 = hv.mean(axis=0)
+def _neg_shell_offsets(hv_coords):
+    """Build the 'negative probe' halo: points ~1.5 A outside each heavy atom,
+    excluding any within 1.4 A of a real atom (cf get_negative_probe_structure).
+    This is the discreteness/anti-bulk term -- density should sit ON the ligand
+    and be empty just AROUND it, so a pose that wanders into bulk (protein) is
+    penalised."""
+    offs = list(itertools.product([-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]))
+    pts = []
+    for p in hv_coords:
+        for d in offs:
+            q = p + np.array(d, dtype=np.float64)
+            if np.min(np.linalg.norm(hv_coords - q, axis=1)) < 1.4:
+                continue
+            pts.append(q)
+    return np.array(pts, dtype=np.float64) if pts else hv_coords.copy()
 
-    def _posed(p):
-        st = seed.clone()
-        atoms, pts = [], []
-        for model in st:
-            for chain in model:
-                for r in chain:
-                    for a in r:
-                        atoms.append(a)
-                        pts.append([a.pos.x, a.pos.y, a.pos.z])
-        pts = np.asarray(pts, dtype=np.float64)
+
+def _refine_pose_on_density(seed, de_grid, max_shift=3.0, maxfev=60):
+    """Local refine of a seed pose on DE's *anchored* objective: maximise ligand
+    density on the (protein-masked) score grid while keeping the surrounding
+    shell off-density. Rotation (rotvec about the heavy-atom centroid) + a
+    translation HARD-BOUNDED to +/-max_shift of the seed. Because the grid is
+    protein-masked (no reward on protein) and the shell penalises bulk density --
+    and the FRF already centred the seed on the event -- this cannot drift onto
+    the protein the way a CNN-driven refine does. Returns the refined structure.
+    """
+    atoms, base = [], []
+    for model in seed:
+        for chain in model:
+            for r in chain:
+                for a in r:
+                    atoms.append(a)
+                    base.append([a.pos.x, a.pos.y, a.pos.z])
+    base = np.asarray(base, dtype=np.float64)
+    heavy = np.array([base[i] for i, a in enumerate(atoms)
+                      if a.element.name != "H"], dtype=np.float64)
+    c0 = heavy.mean(axis=0)
+    shell = _neg_shell_offsets(heavy)
+
+    def _xform(pts, p):
         rot = spsp.transform.Rotation.from_rotvec(p[:3]).as_matrix()
-        nc = (pts - c0) @ rot.T + c0 + p[3:]
-        for a, c in zip(atoms, nc):
-            a.pos = gemmi.Position(float(c[0]), float(c[1]), float(c[2]))
-        return st
+        return (pts - c0) @ rot.T + c0 + p[3:]
+
+    def _interp(pts):
+        return np.array([de_grid.interpolate_value(
+            gemmi.Position(float(x), float(y), float(z))) for x, y, z in pts])
 
     def _neg(p):
-        out, _ = score_build(_posed(p), z_grid, raw_xmap_grid)
-        return -float(np.ravel(out)[0])
+        if np.linalg.norm(p[3:]) > max_shift:   # hard translation bound
+            return 10.0
+        lv = _interp(_xform(heavy, p))
+        sv = _interp(_xform(shell, p))
+        # DE's score: ligand-on-density - shell-on-density - ligand-off-density.
+        score = (np.mean(lv >= 0.5) - np.mean(sv >= 0.5) - np.mean(lv < 0.5))
+        return -float(score)
 
+    step = np.array([0.15, 0.15, 0.15, 0.5, 0.5, 0.5])
+    simplex = np.vstack([np.zeros(6)] + [np.eye(6)[i] * step[i] for i in range(6)])
     r = optimize.minimize(
         _neg, np.zeros(6), method="Nelder-Mead",
         options={"initial_simplex": simplex, "xatol": 1e-2, "fatol": 1e-3,
                  "maxfev": maxfev})
-    refined = _posed(r.x)
-    out, arr = score_build(refined, z_grid, raw_xmap_grid)
-    return refined, float(np.ravel(out)[0]), arr
+    rot = spsp.transform.Rotation.from_rotvec(r.x[:3]).as_matrix()
+    nc = (base - c0) @ rot.T + c0 + r.x[3:]
+    st = seed.clone()
+    sa = [a for model in st for chain in model for rr in chain for a in rr]
+    for a, c in zip(sa, nc):
+        a.pos = gemmi.Position(float(c[0]), float(c[1]), float(c[2]))
+    return st
 
 
 def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
                          raw_xmap_grid, res=None, seed_target=None,
-                         n_seeds=10, maxfev=40):
-    """SH-Crowther FRF seed + per-seed CNN refinement -- the DE-pose-search
-    replacement.
+                         de_grid=None, n_seeds=10):
+    """FRF-seeded minimise-then-score pose search -- the DE replacement.
 
-    FRF density-overlap is rotationally degenerate for small fragments (its
-    optimum sits ~0.6 A off truth), so it cannot pick the orientation by itself;
-    but it reliably places a *seed* within the CNN's ~2 A basin. We therefore use
-    the FRF only to enumerate the top-``n_seeds`` candidate basins, then refine
-    each directly on the build CNN (6-DOF Nelder-Mead) and keep the best. On the
-    BAZ2B test set this matches/beats DE's build CNN on 11/12 at ~3.6x DE's speed.
+    Same shape as the DE path (refine candidate poses on an anchored density
+    objective, then CNN-rank the results), but seeded by the SH-Crowther FRF
+    instead of DE's random restarts -- informed seeding rather than a global
+    search. For each FRF seed we locally refine on DE's own objective
+    (``_refine_pose_on_density``: protein-masked grid + negative shell, bounded
+    translation) and then let the build CNN *rank* the refined poses. The CNN
+    only selects; it never steers the pose (steering it drifts the ligand onto
+    protein density, since the build CNN scores the raw unmasked map in a box
+    that re-centres on the ligand). The masked grid + shell + translation bound
+    keep every pose anchored on the event.
 
-    ``seed_target`` (when given) is the grid the FRF seeds against -- the
-    protein-masked (1-BDC) event map is the best seed target (it isolates the
-    ligand difference density from the protein decoy); falls back to ``z_grid``.
-    The CNN refinement/scoring always uses the UNMASKED ``z_grid`` + ``raw_xmap_grid``
-    (the CNN was trained on unmasked maps). Returns (structure, cnn, centroid, arr).
+    ``seed_target`` is the FRF target (protein-masked 1-BDC event map);
+    ``de_grid`` is the anchored refine target (the DE score grid); ``z_grid`` +
+    ``raw_xmap_grid`` are the unmasked maps the CNN ranks on. Returns
+    (structure, cnn, centroid, arr).
     """
     from .crowther.fit import (
         CrowtherConfig, get_precompute, prepare_event_target,
         fit_conformer_against, sigma_from_resolution)
 
-    # Bound the ligand: max heavy-atom distance from its centroid, + margin.
     coords = np.array(
         [[a.pos.x, a.pos.y, a.pos.z]
          for model in conformer for chain in model for res in chain
@@ -685,9 +712,9 @@ def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
     ligand_radius = float(np.linalg.norm(
         coords - coords.mean(axis=0), axis=1).max()) + 2.0
 
-    # Tunable without recompiling: PANDDA_CROWTHER_NSEEDS / _MAXFEV.
+    # Tunable without recompiling.
     n_seeds = int(os.environ.get("PANDDA_CROWTHER_NSEEDS", n_seeds))
-    maxfev = int(os.environ.get("PANDDA_CROWTHER_MAXFEV", maxfev))
+    max_shift = float(os.environ.get("PANDDA_CROWTHER_MAX_SHIFT", 3.0))
 
     sigma = sigma_from_resolution(res) if res is not None else None
     pre = get_precompute(CrowtherConfig())
@@ -697,15 +724,29 @@ def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
     candidates = fit_conformer_against(
         target, conformer, pre, sigma=sigma, n_candidates=n_seeds)
 
-    # Refine each FRF seed on the CNN; keep the best-CNN refined pose.
+    # minimise (anchored DE objective) then score (CNN rank).
     best = None
     for struct, _tani, _cen in candidates:
-        refined, score, arr = _refine_pose_on_cnn(
-            struct, score_build, z_grid, raw_xmap_grid, maxfev=maxfev)
-        if best is None or score > best[1]:
-            best = (refined, score, arr)
+        refined = (_refine_pose_on_density(struct, de_grid, max_shift=max_shift)
+                   if de_grid is not None else struct)
+        sc, arr = score_build(refined, z_grid, raw_xmap_grid)
+        sc = float(np.ravel(sc)[0])
+        if best is None or sc > best[1]:
+            best = (refined, sc, arr)
     struct, score, arr = best
-    return (struct, score, get_structure_mean(struct), arr)
+    cen = get_structure_mean(struct)
+    # Safety gate: the refine is translation-bounded, so a build far from the
+    # event signals a bug (the drift we fixed). Log it loudly.
+    d = float(np.linalg.norm(np.asarray(cen, float) - np.asarray(centroid_cart, float)))
+    if os.environ.get("PANDDA_CROWTHER_DBG"):
+        seed_d = sorted(float(np.linalg.norm(np.asarray(c[2], float) - np.asarray(centroid_cart, float)))
+                        for c in candidates)
+        print(f"CROWTHERDBG3 centroid_cart={np.round(np.asarray(centroid_cart,float),1)} "
+              f"FRF_seed_dists={[round(x,1) for x in seed_d]} build_dist={d:.1f}", flush=True)
+    if d > 6.0:
+        print(f"WARNING: crowther build {d:.1f} A from event centroid "
+              f"(translation bound {max_shift} A -- should be < ~{max_shift + 2:.0f} A)")
+    return (struct, score, cen, arr)
 
 
 def score_conformer(
@@ -725,8 +766,14 @@ def score_conformer(
     # keeps score_build (the CNN) as the score arbiter, so the return contract
     # and everything downstream are unchanged.
     if os.environ.get("PANDDA_CROWTHER_FIT"):
+        # FRF seeds on the z-map (cut_cube carves its own 64^3 orthonormal cube,
+        # so the source grid's space group/geometry is irrelevant), then refines
+        # each seed on the DE score grid (zmap_grid: masked + anchored, bounded
+        # translation) and CNN-ranks. Same anchored minimise-then-score as the
+        # local path, but on full grids -> no cut_local_grid_from_sparse fold bug.
         return _score_conformer_crowther(
-            centroid_cart, conformer, score_build, z_grid, raw_xmap_grid, res)
+            centroid_cart, conformer, score_build, z_grid, raw_xmap_grid, res,
+            seed_target=z_grid, de_grid=zmap_grid)
 
     centered_structure = center_structure(
         conformer,
@@ -1594,13 +1641,30 @@ def _autobuild_conformer_local(
     # crowther path: FRF seeds against the protein-masked (1-BDC) event map, then
     # each seed is refined directly on the CNN (z_local/rawx_local, unmasked). DE
     # path: differential_evolution against event_local (crowther ignores it).
+    if os.environ.get("PANDDA_CROWTHER_DBG"):
+        za = np.array(z_local, copy=False); ea = np.array(event_local, copy=False)
+        zhi = np.argwhere(za > 2.0); ehi = np.argwhere(ea >= 0.5)
+        zc = (zhi.mean(0) * spacing) if len(zhi) else None
+        ec = (ehi.mean(0) * spacing) if len(ehi) else None
+        print(f"CROWTHERDBG2 centroid_local={np.round(np.asarray(centroid_local,float),1)} "
+              f"z_local_mass_centroid={np.round(zc,1) if zc is not None else None} "
+              f"event_local_mass_centroid={np.round(ec,1) if ec is not None else None}",
+              flush=True)
     if os.environ.get("PANDDA_CROWTHER_FIT"):
-        structure_local = _translate_structure(structure.structure, -box_origin)
-        seed_local = _protein_masked_event_local(
-            rawx_local, mean_local, event_bdc, structure_local, n, spacing)
+        # FRF seeds against z_local (the same centred grid the offline native
+        # test placed at ~0.6 A); the reconstructed protein-masked event map was
+        # off-centre and drove the seed ~14 A off the event. Refine on event_local.
         optimized_local, score, _cen, arr = _score_conformer_crowther(
             centroid_local, conf_local, score_build, z_local, rawx_local, res,
-            seed_target=seed_local)
+            seed_target=z_local, de_grid=event_local)
+        if os.environ.get("PANDDA_CROWTHER_DBG"):
+            bl = np.asarray(_cen, float)              # build centroid, LOCAL frame
+            cl = np.asarray(centroid_local, float)    # event centroid, LOCAL frame
+            print(f"CROWTHERDBG box_origin={np.round(box_origin,1)} "
+                  f"event_local={np.round(cl,1)} build_local={np.round(bl,1)} "
+                  f"build_local-event_local={np.linalg.norm(bl-cl):.1f}A "
+                  f"build_native={np.round(bl+box_origin,1)} "
+                  f"event_native={np.round(np.asarray(centroid,float),1)}", flush=True)
     else:
         optimized_local, score, _cen, arr = score_conformer(
             centroid_local, conf_local, event_local, score_build, z_local, rawx_local, res=res)
