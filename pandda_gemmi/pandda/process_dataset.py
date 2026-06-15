@@ -75,7 +75,7 @@ def _memtrace(stage):
                 store = f"\tray_obj_store_gb={ray._private.utils.get_used_object_store_memory()/1e9:.2f}"
         except Exception:
             pass
-        print(f"MEMTRACE\t{stage}\tsys_used_gb={vm.used/1e9:.1f}"
+        print(f"MEMTRACE\t{stage}\tt={time.time():.1f}\tsys_used_gb={vm.used/1e9:.1f}"
               f"\tsys_avail_gb={vm.available/1e9:.1f}\tself_rss_gb={rss/1e9:.2f}"
               f"\tchildren_rss_gb={children/1e9:.2f}{store}", flush=True)
     except Exception as e:

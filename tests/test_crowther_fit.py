@@ -376,3 +376,92 @@ def test_event_target_prepared_once_fits_many_conformers():
         st, _s, _c = fit_conformer_against(event_target, conformer, pre)
         rmsd = np.sqrt(((_heavy_coords(st) - truth) ** 2).sum(axis=1).mean())
         assert rmsd < 1.5, f"reuse RMSD {rmsd:.2f} A (euler {euler})"
+
+
+# --- placement: hydrogens move rigidly, no origin-at-zero assumption --------
+
+def _gemmi_structure_with_h(heavy, hydrogens):
+    """Conformer carrying heavy atoms AND hydrogens (so a placement that skips H
+    is observable). Heavy atoms come first, matching _heavy_atoms' order."""
+    st = gemmi.Structure()
+    model = gemmi.Model("1")
+    chain = gemmi.Chain("X")
+    res = gemmi.Residue()
+    res.name = "LIG"
+    res.seqid = gemmi.SeqId(1, " ")
+    for i, (x, y, z) in enumerate(heavy):
+        a = gemmi.Atom()
+        a.name = f"C{i}"
+        a.element = gemmi.Element("C")
+        a.pos = gemmi.Position(float(x), float(y), float(z))
+        res.add_atom(a)
+    for i, (x, y, z) in enumerate(hydrogens):
+        a = gemmi.Atom()
+        a.name = f"H{i}"
+        a.element = gemmi.Element("H")
+        a.pos = gemmi.Position(float(x), float(y), float(z))
+        res.add_atom(a)
+    chain.add_residue(res)
+    model.add_chain(chain)
+    st.add_model(model)
+    return st
+
+
+def _all_coords(structure):
+    out = []
+    for model in structure:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    p = atom.pos
+                    out.append([p.x, p.y, p.z])
+    return np.array(out)
+
+
+@pytest.mark.parametrize("box_origin", [
+    np.array([0.0, 0.0, 0.0]),          # origin-at-zero -- must not be assumed
+    np.array([37.0, -21.0, 58.0]),      # far-from-origin native / event frame
+])
+def test_place_structure_moves_hydrogens_rigidly(box_origin):
+    """Regression for the stranded-hydrogen placement bug AND the implicit
+    origin-at-zero assumption it hid behind.
+
+    _place_structure receives only the placed HEAVY positions (what the FRF
+    hands back), recovers the rigid transform by Kabsch, and must apply it to
+    ALL atoms -- hydrogens included. The old code set only heavy positions and
+    skipped H, leaving every H at its embedded position; that dragged the
+    all-atom centroid (and the CNN ligand mask it drives) off the event by tens
+    of A once the event sits far from the origin -- which is exactly the
+    real-data case (native frames are nowhere near zero). Parametrising over a
+    non-zero box_origin pins both failure modes at once.
+    """
+    from scipy.spatial.transform import Rotation
+    from pandda_gemmi.autobuild.crowther.fit import _place_structure
+
+    heavy0 = _COORDS.copy()
+    # one H ~1 A off each heavy atom (deterministic, asymmetric offsets)
+    h_off = np.array([[0.9, 0.2, 0.1], [-0.3, 0.8, 0.4], [0.1, -0.9, 0.3],
+                      [0.2, 0.3, 0.9], [-0.7, -0.5, 0.2], [0.4, -0.2, -0.8]])
+    hyd0 = heavy0 + h_off
+    conformer = _gemmi_structure_with_h(heavy0, hyd0)
+
+    # a known rigid transform onto a target sitting at box_origin
+    R = Rotation.from_euler("xyz", [33.0, -47.0, 12.0], degrees=True).as_matrix()
+    hc = heavy0.mean(axis=0)
+    def xform(p):
+        return (p - hc) @ R.T + hc + box_origin
+    coords = xform(heavy0)                                   # placed heavy (the input)
+    expected_all = xform(np.vstack([heavy0, hyd0]))          # rigid truth, all atoms
+
+    placed = _place_structure(conformer, coords)
+    got = _all_coords(placed)
+
+    # every atom -- heavy AND H -- lands on the rigidly transformed truth
+    assert np.allclose(got, expected_all, atol=1e-6), \
+        f"max atom deviation {np.abs(got - expected_all).max():.3f} A"
+    # heavy atoms land exactly on the requested coords
+    assert np.allclose(got[:len(heavy0)], coords, atol=1e-6)
+    # the stranded-H signature: the all-atom centroid tracks the heavy target,
+    # it does NOT collapse back toward the embedded origin (which, with a
+    # far-from-zero box_origin, would put it tens of A away).
+    assert np.linalg.norm(got.mean(axis=0) - coords.mean(axis=0)) < 1.0

@@ -624,14 +624,17 @@ def _neg_shell_offsets(hv_coords):
     return np.array(pts, dtype=np.float64) if pts else hv_coords.copy()
 
 
-def _refine_pose_on_density(seed, de_grid, max_shift=3.0, maxfev=60):
+def _refine_pose_on_density(seed, de_grid, max_shift=10.0, maxfev=60):
     """Local refine of a seed pose on DE's *anchored* objective: maximise ligand
     density on the (protein-masked) score grid while keeping the surrounding
-    shell off-density. Rotation (rotvec about the heavy-atom centroid) + a
-    translation HARD-BOUNDED to +/-max_shift of the seed. Because the grid is
-    protein-masked (no reward on protein) and the shell penalises bulk density --
-    and the FRF already centred the seed on the event -- this cannot drift onto
-    the protein the way a CNN-driven refine does. Returns the refined structure.
+    shell off-density. Rotation (rotvec about the heavy-atom centroid) +
+    translation, with a loose +/-max_shift backstop on the translation. The
+    backstop is a runaway-sanity guard only, NOT a pose-shaping restraint: an A/B
+    with the bound effectively off (50 A) left every build on-event (mean 1.6 A,
+    max 2.9 A from the event, vs 1.5 A / 2.9 A bounded), so the protein-masked
+    grid + negative shell + FRF-centred seed anchor the pose by themselves. The
+    bound only trips on pathological drift; it never determines a real pose.
+    Returns the refined structure.
     """
     atoms, base = [], []
     for model in seed:
@@ -714,7 +717,7 @@ def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
 
     # Tunable without recompiling.
     n_seeds = int(os.environ.get("PANDDA_CROWTHER_NSEEDS", n_seeds))
-    max_shift = float(os.environ.get("PANDDA_CROWTHER_MAX_SHIFT", 3.0))
+    max_shift = float(os.environ.get("PANDDA_CROWTHER_MAX_SHIFT", 10.0))
 
     sigma = sigma_from_resolution(res) if res is not None else None
     pre = get_precompute(CrowtherConfig())
@@ -735,17 +738,13 @@ def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
             best = (refined, sc, arr)
     struct, score, arr = best
     cen = get_structure_mean(struct)
-    # Safety gate: the refine is translation-bounded, so a build far from the
-    # event signals a bug (the drift we fixed). Log it loudly.
+    # Tripwire: the refine is anchored on the masked event density (FRF-centred
+    # seed + protein-masked grid + negative shell), so a build far from the event
+    # signals a regression in placement (the drift/stranded-H bugs we fixed).
     d = float(np.linalg.norm(np.asarray(cen, float) - np.asarray(centroid_cart, float)))
-    if os.environ.get("PANDDA_CROWTHER_DBG"):
-        seed_d = sorted(float(np.linalg.norm(np.asarray(c[2], float) - np.asarray(centroid_cart, float)))
-                        for c in candidates)
-        print(f"CROWTHERDBG3 centroid_cart={np.round(np.asarray(centroid_cart,float),1)} "
-              f"FRF_seed_dists={[round(x,1) for x in seed_d]} build_dist={d:.1f}", flush=True)
     if d > 6.0:
         print(f"WARNING: crowther build {d:.1f} A from event centroid "
-              f"(translation bound {max_shift} A -- should be < ~{max_shift + 2:.0f} A)")
+              f"(expected on-event, ~<3 A) -- possible placement regression")
     return (struct, score, cen, arr)
 
 
@@ -1573,38 +1572,6 @@ def _translate_structure(st, vec):
     return out
 
 
-def _protein_masked_event_local(rawx_local, mean_local, bdc, structure_local,
-                                n, spacing):
-    """Build the FRF seed target in the local box: the (1-BDC) background-
-    corrected event map (xmap - bdc*mean) with the protein decoy zeroed (density
-    within 1.5 A of any standard-residue atom). On the BAZ2B test set this is the
-    best seed target -- it isolates the ligand difference density from both bulk
-    background and the protein, giving the cleanest seeds. ``structure_local`` is
-    the dataset model already translated into the box-local frame (-box_origin)."""
-    ev = np.array(rawx_local, copy=True) - float(bdc) * np.array(mean_local, copy=False)
-    seed = gemmi.FloatGrid(n, n, n)
-    cell = gemmi.UnitCell(n * spacing, n * spacing, n * spacing, 90.0, 90.0, 90.0)
-    seed.set_unit_cell(cell)
-    seed.spacegroup = gemmi.SpaceGroup("P 1")
-    np.array(seed, copy=False)[:, :, :] = ev.astype(np.float32)
-
-    mask = gemmi.Int8Grid(n, n, n)
-    mask.set_unit_cell(cell)
-    mask.spacegroup = gemmi.SpaceGroup("P 1")
-    box = n * spacing
-    for model in structure_local:
-        for chain in model:
-            for residue in chain:
-                if residue.name in constants.RESIDUE_NAMES:
-                    for atom in residue:
-                        p = atom.pos
-                        if (-1.5 <= p.x <= box + 1.5 and -1.5 <= p.y <= box + 1.5
-                                and -1.5 <= p.z <= box + 1.5):
-                            mask.set_points_around(p, radius=1.5, value=1)
-    np.array(seed, copy=False)[np.nonzero(np.array(mask, copy=False))] = 0.0
-    return seed
-
-
 def _autobuild_conformer_local(
         centroid, event_bdc, conformer, masked_dtag_array, masked_mean_array,
         reference_frame, out_dir, conformer_id, res, structure,
@@ -1638,18 +1605,9 @@ def _autobuild_conformer_local(
     centroid_local = np.asarray(centroid, dtype=np.float64) - box_origin
     conf_local = _translate_structure(conformer.structure, -box_origin)
 
-    # crowther path: FRF seeds against the protein-masked (1-BDC) event map, then
-    # each seed is refined directly on the CNN (z_local/rawx_local, unmasked). DE
-    # path: differential_evolution against event_local (crowther ignores it).
-    if os.environ.get("PANDDA_CROWTHER_DBG"):
-        za = np.array(z_local, copy=False); ea = np.array(event_local, copy=False)
-        zhi = np.argwhere(za > 2.0); ehi = np.argwhere(ea >= 0.5)
-        zc = (zhi.mean(0) * spacing) if len(zhi) else None
-        ec = (ehi.mean(0) * spacing) if len(ehi) else None
-        print(f"CROWTHERDBG2 centroid_local={np.round(np.asarray(centroid_local,float),1)} "
-              f"z_local_mass_centroid={np.round(zc,1) if zc is not None else None} "
-              f"event_local_mass_centroid={np.round(ec,1) if ec is not None else None}",
-              flush=True)
+    # crowther path: FRF seeds against z_local, each refined on event_local (the
+    # anchored masked-density objective), then CNN-ranked. DE path:
+    # differential_evolution against event_local (crowther ignores z_local seed).
     if os.environ.get("PANDDA_CROWTHER_FIT"):
         # FRF seeds against z_local (the same centred grid the offline native
         # test placed at ~0.6 A); the reconstructed protein-masked event map was
@@ -1657,14 +1615,6 @@ def _autobuild_conformer_local(
         optimized_local, score, _cen, arr = _score_conformer_crowther(
             centroid_local, conf_local, score_build, z_local, rawx_local, res,
             seed_target=z_local, de_grid=event_local)
-        if os.environ.get("PANDDA_CROWTHER_DBG"):
-            bl = np.asarray(_cen, float)              # build centroid, LOCAL frame
-            cl = np.asarray(centroid_local, float)    # event centroid, LOCAL frame
-            print(f"CROWTHERDBG box_origin={np.round(box_origin,1)} "
-                  f"event_local={np.round(cl,1)} build_local={np.round(bl,1)} "
-                  f"build_local-event_local={np.linalg.norm(bl-cl):.1f}A "
-                  f"build_native={np.round(bl+box_origin,1)} "
-                  f"event_native={np.round(np.asarray(centroid,float),1)}", flush=True)
     else:
         optimized_local, score, _cen, arr = score_conformer(
             centroid_local, conf_local, event_local, score_build, z_local, rawx_local, res=res)
