@@ -590,6 +590,147 @@ def transform_structure(structure, translation, rotation_matrix):
     return structure_copy
 
 
+def _neg_shell_offsets(hv_coords):
+    """Build the 'negative probe' halo: points ~1.5 A outside each heavy atom,
+    excluding any within 1.4 A of a real atom (cf get_negative_probe_structure).
+    This is the discreteness/anti-bulk term -- density should sit ON the ligand
+    and be empty just AROUND it, so a pose that wanders into bulk (protein) is
+    penalised."""
+    offs = list(itertools.product([-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]))
+    pts = []
+    for p in hv_coords:
+        for d in offs:
+            q = p + np.array(d, dtype=np.float64)
+            if np.min(np.linalg.norm(hv_coords - q, axis=1)) < 1.4:
+                continue
+            pts.append(q)
+    return np.array(pts, dtype=np.float64) if pts else hv_coords.copy()
+
+
+def _refine_pose_on_density(seed, de_grid, max_shift=10.0, maxfev=60):
+    """Local refine of a seed pose on DE's *anchored* objective: maximise ligand
+    density on the (protein-masked) score grid while keeping the surrounding
+    shell off-density. Rotation (rotvec about the heavy-atom centroid) +
+    translation, with a loose +/-max_shift backstop on the translation. The
+    backstop is a runaway-sanity guard only, NOT a pose-shaping restraint: an A/B
+    with the bound effectively off (50 A) left every build on-event (mean 1.6 A,
+    max 2.9 A from the event, vs 1.5 A / 2.9 A bounded), so the protein-masked
+    grid + negative shell + FRF-centred seed anchor the pose by themselves. The
+    bound only trips on pathological drift; it never determines a real pose.
+    Returns the refined structure.
+    """
+    atoms, base = [], []
+    for model in seed:
+        for chain in model:
+            for r in chain:
+                for a in r:
+                    atoms.append(a)
+                    base.append([a.pos.x, a.pos.y, a.pos.z])
+    base = np.asarray(base, dtype=np.float64)
+    heavy = np.array([base[i] for i, a in enumerate(atoms)
+                      if a.element.name != "H"], dtype=np.float64)
+    c0 = heavy.mean(axis=0)
+    shell = _neg_shell_offsets(heavy)
+
+    def _xform(pts, p):
+        rot = spsp.transform.Rotation.from_rotvec(p[:3]).as_matrix()
+        return (pts - c0) @ rot.T + c0 + p[3:]
+
+    def _interp(pts):
+        return np.array([de_grid.interpolate_value(
+            gemmi.Position(float(x), float(y), float(z))) for x, y, z in pts])
+
+    def _neg(p):
+        if np.linalg.norm(p[3:]) > max_shift:   # hard translation bound
+            return 10.0
+        lv = _interp(_xform(heavy, p))
+        sv = _interp(_xform(shell, p))
+        # DE's score: ligand-on-density - shell-on-density - ligand-off-density.
+        score = (np.mean(lv >= 0.5) - np.mean(sv >= 0.5) - np.mean(lv < 0.5))
+        return -float(score)
+
+    step = np.array([0.15, 0.15, 0.15, 0.5, 0.5, 0.5])
+    simplex = np.vstack([np.zeros(6)] + [np.eye(6)[i] * step[i] for i in range(6)])
+    r = optimize.minimize(
+        _neg, np.zeros(6), method="Nelder-Mead",
+        options={"initial_simplex": simplex, "xatol": 1e-2, "fatol": 1e-3,
+                 "maxfev": maxfev})
+    rot = spsp.transform.Rotation.from_rotvec(r.x[:3]).as_matrix()
+    nc = (base - c0) @ rot.T + c0 + r.x[3:]
+    st = seed.clone()
+    sa = [a for model in st for chain in model for rr in chain for a in rr]
+    for a, c in zip(sa, nc):
+        a.pos = gemmi.Position(float(c[0]), float(c[1]), float(c[2]))
+    return st
+
+
+def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
+                         raw_xmap_grid, res=None, seed_target=None,
+                         de_grid=None, n_seeds=10):
+    """FRF-seeded minimise-then-score pose search -- the DE replacement.
+
+    Same shape as the DE path (refine candidate poses on an anchored density
+    objective, then CNN-rank the results), but seeded by the SH-Crowther FRF
+    instead of DE's random restarts -- informed seeding rather than a global
+    search. For each FRF seed we locally refine on DE's own objective
+    (``_refine_pose_on_density``: protein-masked grid + negative shell, bounded
+    translation) and then let the build CNN *rank* the refined poses. The CNN
+    only selects; it never steers the pose (steering it drifts the ligand onto
+    protein density, since the build CNN scores the raw unmasked map in a box
+    that re-centres on the ligand). The masked grid + shell + translation bound
+    keep every pose anchored on the event.
+
+    ``seed_target`` is the FRF target (protein-masked 1-BDC event map);
+    ``de_grid`` is the anchored refine target (the DE score grid); ``z_grid`` +
+    ``raw_xmap_grid`` are the unmasked maps the CNN ranks on. Returns
+    (structure, cnn, centroid, arr).
+    """
+    from .crowther.fit import (
+        CrowtherConfig, get_precompute, prepare_event_target,
+        fit_conformer_against, sigma_from_resolution)
+
+    coords = np.array(
+        [[a.pos.x, a.pos.y, a.pos.z]
+         for model in conformer for chain in model for res in chain
+         for a in res if a.element.name != "H"],
+        dtype=np.float64,
+    )
+    ligand_radius = float(np.linalg.norm(
+        coords - coords.mean(axis=0), axis=1).max()) + 2.0
+
+    # Tunable without recompiling.
+    n_seeds = int(os.environ.get("PANDDA_CROWTHER_NSEEDS", n_seeds))
+    max_shift = float(os.environ.get("PANDDA_CROWTHER_MAX_SHIFT", 10.0))
+
+    sigma = sigma_from_resolution(res) if res is not None else None
+    pre = get_precompute(CrowtherConfig())
+    target = prepare_event_target(
+        z_grid if seed_target is None else seed_target,
+        centroid_cart, pre, ligand_radius=ligand_radius)
+    candidates = fit_conformer_against(
+        target, conformer, pre, sigma=sigma, n_candidates=n_seeds)
+
+    # minimise (anchored DE objective) then score (CNN rank).
+    best = None
+    for struct, _tani, _cen in candidates:
+        refined = (_refine_pose_on_density(struct, de_grid, max_shift=max_shift)
+                   if de_grid is not None else struct)
+        sc, arr = score_build(refined, z_grid, raw_xmap_grid)
+        sc = float(np.ravel(sc)[0])
+        if best is None or sc > best[1]:
+            best = (refined, sc, arr)
+    struct, score, arr = best
+    cen = get_structure_mean(struct)
+    # Tripwire: the refine is anchored on the masked event density (FRF-centred
+    # seed + protein-masked grid + negative shell), so a build far from the event
+    # signals a regression in placement (the drift/stranded-H bugs we fixed).
+    d = float(np.linalg.norm(np.asarray(cen, float) - np.asarray(centroid_cart, float)))
+    if d > 6.0:
+        print(f"WARNING: crowther build {d:.1f} A from event centroid "
+              f"(expected on-event, ~<3 A) -- possible placement regression")
+    return (struct, score, cen, arr)
+
+
 def score_conformer(
         centroid_cart,
         conformer,
@@ -599,8 +740,17 @@ def score_conformer(
             raw_xmap_grid,
         #event_fit_num_trys=6,
         event_fit_num_trys=12,
-
+        res=None,
 ):
+    # Experimental SH-Crowther fast-rotation-function pose search, in place of
+    # the differential_evolution search below. PANDDA_CROWTHER_FIT=1. FRF seeds
+    # on the z map, each seed refined on the DE score grid (zmap_grid) and
+    # CNN-ranked (score_build), so the return contract is unchanged.
+    if env_flag("PANDDA_CROWTHER_FIT"):
+        return _score_conformer_crowther(
+            centroid_cart, conformer, score_build, z_grid, raw_xmap_grid, res,
+            seed_target=z_grid, de_grid=zmap_grid)
+
     centered_structure = center_structure(
         conformer,
         centroid_cart,
@@ -1353,9 +1503,16 @@ def _autobuild_conformer_local(
     centroid_local = np.asarray(centroid, dtype=np.float64) - box_origin
     conf_local = _translate_structure(conformer.structure, -box_origin)
 
-    # Same fit as the full-cell path, on the local box.
-    optimized_local, score, _cen, arr = score_conformer(
-        centroid_local, conf_local, event_local, score_build, z_local, rawx_local)
+    # Same fit as the full-cell path, on the local box: FRF seeds against
+    # z_local refined on event_local (crowther), or DE against event_local.
+    if env_flag("PANDDA_CROWTHER_FIT"):
+        optimized_local, score, _cen, arr = _score_conformer_crowther(
+            centroid_local, conf_local, score_build, z_local, rawx_local, res,
+            seed_target=z_local, de_grid=event_local)
+    else:
+        optimized_local, score, _cen, arr = score_conformer(
+            centroid_local, conf_local, event_local, score_build, z_local, rawx_local,
+            res=res)
 
     predicted_mask = get_predicted_mask(optimized_local, xmap_local)
     predicted_mask_array = np.array(predicted_mask, copy=False)
@@ -1468,6 +1625,7 @@ def autobuild_conformer(
         score_build,
         z_grid,
         raw_xmap_grid,
+        res=res,
     )
     time_finish_score_conf = time.time()
 
