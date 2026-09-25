@@ -1476,6 +1476,22 @@ def _autobuild_conformer_local(
     # difference from the full-cell path is an edge effect.
     if radius is None:
         radius = float(os.environ.get("PANDDA_LOCAL_RADIUS", 24.0))
+
+    # The crowther FRF cuts its OWN orthonormal cube (CrowtherConfig.grid x
+    # .spacing = 32 A by default) out of whatever grid it is handed, centred on
+    # the event. That cube must lie inside the sub-block: outside it the grid is
+    # periodic, so gemmi would wrap density from the far side into the FRF
+    # target instead of failing. Nothing checks this, and radius is tunable, so
+    # check it here rather than silently fitting against wrapped density.
+    if env_flag("PANDDA_CROWTHER_FIT"):
+        from .crowther.fit import CrowtherConfig
+        _half_cube = (CrowtherConfig.grid * CrowtherConfig.spacing) / 2.0
+        if radius < _half_cube:
+            raise ValueError(
+                f"PANDDA_LOCAL_RADIUS={radius} A is smaller than the crowther "
+                f"cube half-width ({_half_cube} A); the FRF would sample outside "
+                f"the sub-block and wrap. Use at least {_half_cube} A."
+            )
     normalize_z = (z_array - np.mean(z_array)) / np.std(z_array)
     normalize_xmap = (masked_dtag_array - np.mean(masked_dtag_array)) / np.std(masked_dtag_array)
     # The fit's score-grid target (same construction as the full path), built
