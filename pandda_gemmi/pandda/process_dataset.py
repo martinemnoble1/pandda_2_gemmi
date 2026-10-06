@@ -563,7 +563,7 @@ def process_dataset(
 
         # Filter the events to select those to output event maps for and to autobuild
         # This step can be dangerous in that events with high multiplity (for example due to NCS) could be filtered
-        top_selected_model_events = filter_selected_events(dtag, selected_events, )
+        top_selected_model_events = filter_selected_events(dtag, selected_events, args.max_events_per_dataset)
 
     print(f'Collecting events...')
     for event_id, event in top_selected_model_events.items():
