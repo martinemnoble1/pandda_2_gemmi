@@ -42,7 +42,15 @@ class RankHighEventScoreBySite:
 
                 sorted(
                     sites.values(), 
-                    key=lambda _site: max([get_event_score(events[_event_id]) for _event_id in _site.event_ids]),  # Max is safe: no event should have zero events 
+                    # The invariant asserted here ("no event should have zero events")
+                    # does not hold for ResiduePainting, which can emit a site with an
+                    # empty event_ids -> "max() arg is an empty sequence". default keeps
+                    # such a site, ranked last, rather than dropping it silently -- but
+                    # why an empty site is produced belongs in the site model.
+                    key=lambda _site: max(
+                        [get_event_score(events[_event_id]) for _event_id in _site.event_ids],
+                        default=float("-inf"),
+                    ),
                     reverse=True
                 ),
             ):
