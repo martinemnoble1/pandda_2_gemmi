@@ -579,7 +579,7 @@ class PanDDAKWArgs:
         )
         parser.add_argument(
             constants.ARGS_MAX_EVENTS_PER_DATASET,
-            type=str,
+            type=int,
             default=constants.ARGS_MAX_EVENTS_PER_DATASET_DEFAULT,
             help=constants.ARGS_MAX_EVENTS_PER_DATASET_HELP,
         )
