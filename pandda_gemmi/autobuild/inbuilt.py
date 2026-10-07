@@ -21,6 +21,9 @@ from ..dataset.structure import save_structure, load_structure, Structure
 from ..dataset.small import get_fragment_mol_from_dataset_cif_path
 from ..dataset.small import get_comp_block_key
 from .autobuild import AutobuildResult
+from ..args.env import env_flag
+from .local_grid import (native_subblock_frame, subblock_from_sparse,
+                         subblock_from_dense)
 
 
 def get_fragment_mol_from_dataset_smiles_path(dataset_smiles_path: Path):
@@ -91,6 +94,30 @@ def get_structures_from_mol(mol: Chem.Mol, dataset_cif_path, max_conformers):
     return fragment_structures
 
 
+def _de_seed():
+    """Optional fixed RNG seed for the stochastic autobuild steps
+    (differential_evolution + RDKit conformer embedding), from PANDDA_DE_SEED.
+    Returns int when set, else None (scipy/RDKit default = unseeded). Setting it
+    makes autobuild deterministic so e.g. local-grid vs full-grid runs can be
+    compared without the DE-randomness confound."""
+    v = os.environ.get("PANDDA_DE_SEED")
+    return int(v) if v not in (None, "") else None
+
+
+def _max_ligand_heavy_atoms():
+    # A fragment-screening ligand is a small molecule (typically < ~50 heavy
+    # atoms; a ~15-residue peptide is still < 150). Anything far above this is
+    # not a ligand -- almost always a model/protein file mis-detected as one via
+    # a permissive ligand regex. Building it as a fragment is meaningless and, on
+    # a large complex, exhausts memory (it OOM'd a 128 GB box). Tunable.
+    return int(os.environ.get("PANDDA_MAX_LIGAND_ATOMS", 150))
+
+
+def _structure_heavy_atom_count(st):
+    return sum(1 for model in st for chain in model for residue in chain
+               for atom in residue if atom.element.name != "H")
+
+
 def get_conformers(
         ligand_files: LigandFilesInterface,
         pruning_threshold=1.5,
@@ -102,6 +129,19 @@ def get_conformers(
     if ligand_files.ligand_cif is not None:
         mol = get_fragment_mol_from_dataset_cif_path(ligand_files.ligand_cif)
 
+        # Guard: refuse to treat a non-fragment (e.g. a whole protein/model
+        # mis-detected as a ligand) as a buildable ligand -- before the
+        # expensive conformer embedding. See _max_ligand_heavy_atoms.
+        if mol is None:
+            return {}
+        n_heavy = mol.GetNumHeavyAtoms()
+        if n_heavy > _max_ligand_heavy_atoms():
+            print(f"Ligand from {ligand_files.ligand_cif.name} has {n_heavy} heavy "
+                  f"atoms (> {_max_ligand_heavy_atoms()} fragment limit): skipping. "
+                  f"This is almost certainly a model/protein file mis-detected as a "
+                  f"ligand (check your --ligand_cif_regex / --ligand_pdb_regex).")
+            return {}
+
         # Generate conformers
         # mol.CalcImplicitValence()
         # mol: Chem.Mol = Chem.AddHs(mol)
@@ -111,6 +151,7 @@ def get_conformers(
             mol,
             numConfs=num_pose_samples,
             pruneRmsThresh=pruning_threshold,
+            randomSeed=(_de_seed() if _de_seed() is not None else -1),
         )
 
         # Translate to structures
@@ -144,7 +185,20 @@ def get_conformers(
 
     if ligand_files.ligand_pdb is not None:
 
-        fragment_structures = {0: load_structure(ligand_files.ligand_pdb), }
+        st = load_structure(ligand_files.ligand_pdb)
+        st = getattr(st, "structure", st)
+
+        # Same guard for the pdb path: a whole-protein "ligand" pdb is not a
+        # fragment and must not be built/docked (memory blow-up on large cells).
+        n_heavy = _structure_heavy_atom_count(st)
+        if n_heavy > _max_ligand_heavy_atoms():
+            print(f"Ligand from {ligand_files.ligand_pdb.name} has {n_heavy} heavy "
+                  f"atoms (> {_max_ligand_heavy_atoms()} fragment limit): skipping. "
+                  f"This is almost certainly a model/protein file mis-detected as a "
+                  f"ligand (check your --ligand_pdb_regex).")
+            return {}
+
+        fragment_structures = {0: st, }
 
         return fragment_structures
 
@@ -536,6 +590,147 @@ def transform_structure(structure, translation, rotation_matrix):
     return structure_copy
 
 
+def _neg_shell_offsets(hv_coords):
+    """Build the 'negative probe' halo: points ~1.5 A outside each heavy atom,
+    excluding any within 1.4 A of a real atom (cf get_negative_probe_structure).
+    This is the discreteness/anti-bulk term -- density should sit ON the ligand
+    and be empty just AROUND it, so a pose that wanders into bulk (protein) is
+    penalised."""
+    offs = list(itertools.product([-1.5, 1.5], [-1.5, 1.5], [-1.5, 1.5]))
+    pts = []
+    for p in hv_coords:
+        for d in offs:
+            q = p + np.array(d, dtype=np.float64)
+            if np.min(np.linalg.norm(hv_coords - q, axis=1)) < 1.4:
+                continue
+            pts.append(q)
+    return np.array(pts, dtype=np.float64) if pts else hv_coords.copy()
+
+
+def _refine_pose_on_density(seed, de_grid, max_shift=10.0, maxfev=60):
+    """Local refine of a seed pose on DE's *anchored* objective: maximise ligand
+    density on the (protein-masked) score grid while keeping the surrounding
+    shell off-density. Rotation (rotvec about the heavy-atom centroid) +
+    translation, with a loose +/-max_shift backstop on the translation. The
+    backstop is a runaway-sanity guard only, NOT a pose-shaping restraint: an A/B
+    with the bound effectively off (50 A) left every build on-event (mean 1.6 A,
+    max 2.9 A from the event, vs 1.5 A / 2.9 A bounded), so the protein-masked
+    grid + negative shell + FRF-centred seed anchor the pose by themselves. The
+    bound only trips on pathological drift; it never determines a real pose.
+    Returns the refined structure.
+    """
+    atoms, base = [], []
+    for model in seed:
+        for chain in model:
+            for r in chain:
+                for a in r:
+                    atoms.append(a)
+                    base.append([a.pos.x, a.pos.y, a.pos.z])
+    base = np.asarray(base, dtype=np.float64)
+    heavy = np.array([base[i] for i, a in enumerate(atoms)
+                      if a.element.name != "H"], dtype=np.float64)
+    c0 = heavy.mean(axis=0)
+    shell = _neg_shell_offsets(heavy)
+
+    def _xform(pts, p):
+        rot = spsp.transform.Rotation.from_rotvec(p[:3]).as_matrix()
+        return (pts - c0) @ rot.T + c0 + p[3:]
+
+    def _interp(pts):
+        return np.array([de_grid.interpolate_value(
+            gemmi.Position(float(x), float(y), float(z))) for x, y, z in pts])
+
+    def _neg(p):
+        if np.linalg.norm(p[3:]) > max_shift:   # hard translation bound
+            return 10.0
+        lv = _interp(_xform(heavy, p))
+        sv = _interp(_xform(shell, p))
+        # DE's score: ligand-on-density - shell-on-density - ligand-off-density.
+        score = (np.mean(lv >= 0.5) - np.mean(sv >= 0.5) - np.mean(lv < 0.5))
+        return -float(score)
+
+    step = np.array([0.15, 0.15, 0.15, 0.5, 0.5, 0.5])
+    simplex = np.vstack([np.zeros(6)] + [np.eye(6)[i] * step[i] for i in range(6)])
+    r = optimize.minimize(
+        _neg, np.zeros(6), method="Nelder-Mead",
+        options={"initial_simplex": simplex, "xatol": 1e-2, "fatol": 1e-3,
+                 "maxfev": maxfev})
+    rot = spsp.transform.Rotation.from_rotvec(r.x[:3]).as_matrix()
+    nc = (base - c0) @ rot.T + c0 + r.x[3:]
+    st = seed.clone()
+    sa = [a for model in st for chain in model for rr in chain for a in rr]
+    for a, c in zip(sa, nc):
+        a.pos = gemmi.Position(float(c[0]), float(c[1]), float(c[2]))
+    return st
+
+
+def _score_conformer_crowther(centroid_cart, conformer, score_build, z_grid,
+                         raw_xmap_grid, res=None, seed_target=None,
+                         de_grid=None, n_seeds=10):
+    """FRF-seeded minimise-then-score pose search -- the DE replacement.
+
+    Same shape as the DE path (refine candidate poses on an anchored density
+    objective, then CNN-rank the results), but seeded by the SH-Crowther FRF
+    instead of DE's random restarts -- informed seeding rather than a global
+    search. For each FRF seed we locally refine on DE's own objective
+    (``_refine_pose_on_density``: protein-masked grid + negative shell, bounded
+    translation) and then let the build CNN *rank* the refined poses. The CNN
+    only selects; it never steers the pose (steering it drifts the ligand onto
+    protein density, since the build CNN scores the raw unmasked map in a box
+    that re-centres on the ligand). The masked grid + shell + translation bound
+    keep every pose anchored on the event.
+
+    ``seed_target`` is the FRF target (protein-masked 1-BDC event map);
+    ``de_grid`` is the anchored refine target (the DE score grid); ``z_grid`` +
+    ``raw_xmap_grid`` are the unmasked maps the CNN ranks on. Returns
+    (structure, cnn, centroid, arr).
+    """
+    from .crowther.fit import (
+        CrowtherConfig, get_precompute, prepare_event_target,
+        fit_conformer_against, sigma_from_resolution)
+
+    coords = np.array(
+        [[a.pos.x, a.pos.y, a.pos.z]
+         for model in conformer for chain in model for res in chain
+         for a in res if a.element.name != "H"],
+        dtype=np.float64,
+    )
+    ligand_radius = float(np.linalg.norm(
+        coords - coords.mean(axis=0), axis=1).max()) + 2.0
+
+    # Tunable without recompiling.
+    n_seeds = int(os.environ.get("PANDDA_CROWTHER_NSEEDS", n_seeds))
+    max_shift = float(os.environ.get("PANDDA_CROWTHER_MAX_SHIFT", 10.0))
+
+    sigma = sigma_from_resolution(res) if res is not None else None
+    pre = get_precompute(CrowtherConfig())
+    target = prepare_event_target(
+        z_grid if seed_target is None else seed_target,
+        centroid_cart, pre, ligand_radius=ligand_radius)
+    candidates = fit_conformer_against(
+        target, conformer, pre, sigma=sigma, n_candidates=n_seeds)
+
+    # minimise (anchored DE objective) then score (CNN rank).
+    best = None
+    for struct, _tani, _cen in candidates:
+        refined = (_refine_pose_on_density(struct, de_grid, max_shift=max_shift)
+                   if de_grid is not None else struct)
+        sc, arr = score_build(refined, z_grid, raw_xmap_grid)
+        sc = float(np.ravel(sc)[0])
+        if best is None or sc > best[1]:
+            best = (refined, sc, arr)
+    struct, score, arr = best
+    cen = get_structure_mean(struct)
+    # Tripwire: the refine is anchored on the masked event density (FRF-centred
+    # seed + protein-masked grid + negative shell), so a build far from the event
+    # signals a regression in placement (the drift/stranded-H bugs we fixed).
+    d = float(np.linalg.norm(np.asarray(cen, float) - np.asarray(centroid_cart, float)))
+    if d > 6.0:
+        print(f"WARNING: crowther build {d:.1f} A from event centroid "
+              f"(expected on-event, ~<3 A) -- possible placement regression")
+    return (struct, score, cen, arr)
+
+
 def score_conformer(
         centroid_cart,
         conformer,
@@ -545,8 +740,17 @@ def score_conformer(
             raw_xmap_grid,
         #event_fit_num_trys=6,
         event_fit_num_trys=12,
-
+        res=None,
 ):
+    # Experimental SH-Crowther fast-rotation-function pose search, in place of
+    # the differential_evolution search below. PANDDA_CROWTHER_FIT=1. FRF seeds
+    # on the z map, each seed refined on the DE score grid (zmap_grid) and
+    # CNN-ranked (score_build), so the return contract is unchanged.
+    if env_flag("PANDDA_CROWTHER_FIT"):
+        return _score_conformer_crowther(
+            centroid_cart, conformer, score_build, z_grid, raw_xmap_grid, res,
+            seed_target=z_grid, de_grid=zmap_grid)
+
     centered_structure = center_structure(
         conformer,
         centroid_cart,
@@ -608,6 +812,7 @@ def score_conformer(
                 (-6.0, 6.0), (-6, 6.0), (-6.0, 6.0),
                 (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)
             ],
+            seed=_de_seed(),
             # popsize=30,
         )
         # res = optimize.shgo(
@@ -1121,6 +1326,7 @@ def get_local_signal_dencalc_optimize_bdc(
             masked_calc_vals,
         ),
         [(0.0, 0.95), ],
+        seed=_de_seed(),
     )
 
     # # Get the correlation with the event
@@ -1242,6 +1448,144 @@ def get_contacts(
     ...
 
 
+def _translate_structure(st, vec):
+    """Return a clone of gemmi structure ``st`` shifted by Cartesian ``vec``."""
+    out = st.clone()
+    vx, vy, vz = float(vec[0]), float(vec[1]), float(vec[2])
+    for model in out:
+        for chain in model:
+            for residue in chain:
+                for atom in residue:
+                    p = atom.pos
+                    atom.pos = gemmi.Position(p.x + vx, p.y + vy, p.z + vz)
+    return out
+
+
+def _autobuild_conformer_local(
+        centroid, event_bdc, conformer, masked_dtag_array, masked_mean_array,
+        reference_frame, out_dir, conformer_id, res, structure,
+        unmasked_dtag_array, unmasked_mean_array, z_array, raw_xmap_sparse,
+        score_build, raw_xmap_array_ref, radius=None):
+    """Memory-light autobuild: cut local boxes from the sparse maps about the event
+    centroid (no full-cell unmask), fit + score (CNN/BDC/signal) entirely in
+    that local box, then map the pose back to the native frame.
+    Mirrors autobuild_conformer's outputs; result is frame-invariant since all
+    scores are translation-invariant."""
+    # Half-width of the Cartesian cube the sub-block must cover. Tunable
+    # (PANDDA_LOCAL_RADIUS) so the block can be grown to test whether a
+    # difference from the full-cell path is an edge effect.
+    if radius is None:
+        radius = float(os.environ.get("PANDDA_LOCAL_RADIUS", 24.0))
+
+    # The crowther FRF cuts its OWN orthonormal cube (CrowtherConfig.grid x
+    # .spacing = 32 A by default) out of whatever grid it is handed, centred on
+    # the event. That cube must lie inside the sub-block: outside it the grid is
+    # periodic, so gemmi would wrap density from the far side into the FRF
+    # target instead of failing. Nothing checks this, and radius is tunable, so
+    # check it here rather than silently fitting against wrapped density.
+    if env_flag("PANDDA_CROWTHER_FIT"):
+        from .crowther.fit import CrowtherConfig
+        _half_cube = (CrowtherConfig.grid * CrowtherConfig.spacing) / 2.0
+        if radius < _half_cube:
+            raise ValueError(
+                f"PANDDA_LOCAL_RADIUS={radius} A is smaller than the crowther "
+                f"cube half-width ({_half_cube} A); the FRF would sample outside "
+                f"the sub-block and wrap. Use at least {_half_cube} A."
+            )
+    normalize_z = (z_array - np.mean(z_array)) / np.std(z_array)
+    normalize_xmap = (masked_dtag_array - np.mean(masked_dtag_array)) / np.std(masked_dtag_array)
+    # The fit's score-grid target (same construction as the full path), built
+    # sparsely so it can be cut locally.
+    score_grid_sparse = np.zeros(normalize_z.shape, dtype=np.float32)
+    score_grid_sparse[normalize_xmap > 1.5] = 0.5
+    score_grid_sparse[normalize_z > 1.5] = 1.0
+
+    # One sub-block frame for every channel: an exact block of the native
+    # lattice, so values and positions are the native ones and the fit sees
+    # bit-identical density to the full-cell path (see local_grid).
+    lo, shape, sub_cell, box_origin = native_subblock_frame(
+        reference_frame, centroid, radius,
+        align_to=np.asarray(raw_xmap_array_ref).shape)
+    z_local = subblock_from_sparse(reference_frame, normalize_z, lo, shape, sub_cell)
+    event_local = subblock_from_sparse(reference_frame, score_grid_sparse, lo, shape, sub_cell)
+    xmap_local = subblock_from_sparse(reference_frame, masked_dtag_array, lo, shape, sub_cell)
+    dtag_local = subblock_from_sparse(reference_frame, unmasked_dtag_array, lo, shape, sub_cell)
+    mean_local = subblock_from_sparse(reference_frame, unmasked_mean_array, lo, shape, sub_cell)
+    # The raw xmap is on its own lattice (sample_rate=3), so this one channel is
+    # resampled onto the sub-block; `raw_xmap_sparse` cannot be used because the
+    # frame's mask indices do not address that array at all.
+    rawx_local = subblock_from_dense(raw_xmap_array_ref, reference_frame, lo, shape, sub_cell)
+
+    centroid_local = np.asarray(centroid, dtype=np.float64) - box_origin
+    conf_local = _translate_structure(conformer.structure, -box_origin)
+
+    # Same fit as the full-cell path, on the local box: FRF seeds against
+    # z_local refined on event_local (crowther), or DE against event_local.
+    if env_flag("PANDDA_CROWTHER_FIT"):
+        optimized_local, score, _cen, arr = _score_conformer_crowther(
+            centroid_local, conf_local, score_build, z_local, rawx_local, res,
+            seed_target=z_local, de_grid=event_local)
+    else:
+        optimized_local, score, _cen, arr = score_conformer(
+            centroid_local, conf_local, event_local, score_build, z_local, rawx_local,
+            res=res)
+
+    predicted_mask = get_predicted_mask(optimized_local, xmap_local)
+    predicted_mask_array = np.array(predicted_mask, copy=False)
+    predicted_density = get_predicted_density(optimized_local, xmap_local)
+    predicted_density_array = np.array(predicted_density, copy=False)
+    try:
+        high = get_predicted_density_high_contour(predicted_density, predicted_mask)
+    except Exception:
+        high = 1.0
+
+    # BDC by maximising calc-vs-event correlation over the ligand mask, on local grids
+    da = np.array(dtag_local, copy=False)
+    me = np.array(mean_local, copy=False)
+    sel = predicted_mask_array >= 2
+    if int(sel.sum()) > 0:
+        rr = optimize.differential_evolution(
+            lambda b: get_correlation(b, da[sel], me[sel], predicted_density_array[sel]),
+            [(0.0, 0.95)], seed=_de_seed())
+        corr = 1 - rr.fun
+        bdc = float(rr.x[0])
+    else:
+        corr, bdc = 0.0, float(event_bdc)
+
+    corrected = (da - bdc * me) / (1 - bdc)
+    signal_vals = get_signal(corrected, predicted_density_array > high)
+    noise_signal_vals = get_signal(corrected, predicted_mask_array == 1)
+    try:
+        optimal_signal_contour = get_optimal_signal_contour(signal_vals, noise_signal_vals)
+    except Exception:
+        optimal_signal_contour = 1.0
+
+    optimized_native = _translate_structure(optimized_local, box_origin)
+    # get_predicted_density stamped the box cell onto the structure; restore the
+    # dataset cell so the saved pdb's CRYST1 is the real one.
+    optimized_native.cell = gemmi.UnitCell(*reference_frame.unit_cell)
+    num_contacts = get_contacts(optimized_native, structure.structure)
+    noise_signal_vals = np.clip(noise_signal_vals, 0.0, 3.0)
+    signal_vals = np.clip(signal_vals, 0.0, 3.0)
+    save_structure(Structure(None, optimized_native), out_dir / f"{conformer_id}.pdb")
+    centroid_native = get_structure_mean(optimized_native)
+
+    return {
+        str(out_dir / f"{conformer_id}.pdb"): {
+            'score': float(score),
+            'centroid': centroid_native,
+            'local_signal': float(corr),
+            'new_bdc': float(bdc),
+            'noise': float(np.abs(np.sum(noise_signal_vals))),
+            'signal': float(np.abs(np.sum(signal_vals))),
+            'num_points': int(np.sum(predicted_density_array > high)),
+            'optimal_contour': float(optimal_signal_contour),
+            'num_contacts': int(num_contacts),
+            'arr': arr,
+        }
+    }
+
+
 def autobuild_conformer(
         centroid,
         event_bdc,
@@ -1260,6 +1604,16 @@ def autobuild_conformer(
         score_build,
         raw_xmap_array_ref
 ):
+    # PANDDA_LOCAL_AUTOBUILD=1 runs the whole build on LOCAL boxes cut from the
+    # sparse maps (no full-cell unmask) -> memory independent of cell size. The
+    # fit and scoring are the same functions as below; only the grids differ.
+    if env_flag("PANDDA_LOCAL_AUTOBUILD"):
+        return _autobuild_conformer_local(
+            centroid, event_bdc, conformer, masked_dtag_array, masked_mean_array,
+            reference_frame, out_dir, conformer_id, res, structure,
+            unmasked_dtag_array, unmasked_mean_array, z_array, raw_xmap_sparse,
+            score_build, raw_xmap_array_ref)
+
     time_begin_autobuild = time.time()
 
 
@@ -1287,6 +1641,7 @@ def autobuild_conformer(
         score_build,
         z_grid,
         raw_xmap_grid,
+        res=res,
     )
     time_finish_score_conf = time.time()
 

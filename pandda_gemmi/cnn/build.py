@@ -132,9 +132,6 @@ class BuildScorer:
                     ]
                 )[np.newaxis,:]
 
-
-        return self.model(
-            torch.from_numpy(
-                arr
-            )
-        ).detach().numpy(), arr
+        with torch.no_grad():
+            out = self.model(torch.from_numpy(arr)).detach().numpy()
+        return out, arr
